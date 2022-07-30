@@ -33,6 +33,10 @@ public:
         wakeup();
     }
 
+    void strike() {
+        while(!_jobs.empty()) _jobs.pop();
+    }
+
     // lvalue reference version
     void post(const Job &job) {
         post(Later{}, job);

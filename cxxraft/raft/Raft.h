@@ -16,8 +16,6 @@ struct Config;
 
 class Raft: public std::enable_shared_from_this<Raft> {
 
-    friend struct Config;
-
 // public API
 public:
 
@@ -27,6 +25,8 @@ public:
 
     // Ask a Raft for its current term, and whether it thinks it is leader
     // return: [term, isLeader] <std::tuple<int, bool>>
+    //
+    // (Note: not state machine `raft::state`)
     auto getState();
 
 public:
@@ -59,8 +59,6 @@ private:
 // (but we use coroutines in a single thread, which is not parallel but concurrent)
 private:
 
-    void step();
-
     // TODO
     // Invoked by leader to replicate log entries (§5.3);
     // also used as heartbeat (§5.2).
@@ -71,15 +69,16 @@ private:
     // return: [term, voteGranted]
     Reply<int, bool> requestVoteRPC(int term, int candidateId /*...*/);
 
-// TODO state machine object
-// state.onReceiveVote() / state.onReceiveAppend()...
-// state.onBecome(/*lastState*/)
 private:
+
+    // See below
+    template <typename NextState>
+    void become();
 
     // @action
     // Leaders send periodic heartbeats (AppendEntriesRPCs that carry no log entries)
     // to all followers in order to maintain their authority.
-    bool becomeLeader();
+    void becomeLeader();
 
     // (§5.2)
     // @when
@@ -92,10 +91,11 @@ private:
     // If a follower receives no communication over a period of time
     // called the election timeout, then it assumes there is no viable
     // leader and begins an election to choose a new leader.
-    bool becomeFollower();
+    void becomeFollower();
 
-    bool becomeCandidate();
+    void becomeCandidate();
 
+// perform can be called by state only
 private:
 
     void performElection();
@@ -190,10 +190,20 @@ private:
     // // TODO
     // int _lastApplied {};
 
-    Bitmask _flags;
+    // Bitmask _flags;
 
+    // TODO idle worker
     Worker _worker;
 
+    // Finite State Machine
+    std::shared_ptr<State> _fsm;
+
+private:
+
+    friend struct Config;
+    friend struct Leader;
+    friend struct Follower;
+    friend struct Candidate;
 };
 
 
@@ -207,34 +217,29 @@ private:
 
 
 
-
+// TODO optional interface
 struct Raft::State {
     struct Literal {};
+
+    State(Raft *master): _master{master}, _flags{} {}
+
     virtual Raft::Bitmask type() { return 0; };
-    virtual const char* type(Literal) { return "unknown"; }
+    virtual const char*   type(Literal) { return "unknown"; }
+    virtual Raft::Bitmask flags() { return _flags; }
+    virtual const char*   flags(Literal) { return "TODO"; }
+
     virtual void onBecome(std::shared_ptr<Raft::State> previous) = 0;
-    // return: next state? or null
-    virtual std::shared_ptr<Raft::State> onReceiveRPC() = 0;
 
-// TODO
-// Raft *master;
-// Bitmask flags;
+    // waiting RPC for a long time
+    virtual void onNotReceiveRPC() = 0;
+
+    virtual Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) = 0;
+
+    virtual Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) = 0;
+protected:
+    Raft *_master;
+    Raft::Bitmask _flags;
 };
-
-struct Leader: public Raft::State {
-    Raft::Bitmask type() override { return Raft::FLAGS_LEADER; };
-    const char* type(Raft::State::Literal) override { return "leader"; };
-    void onBecome(std::shared_ptr<Raft::State> previous) override {
-        // TODO abort pending jobs in previous state?
-        // master->abort...()
-
-        // start leader job
-        // example: appendEntry
-        // master->perform...()
-    }
-    std::shared_ptr<Raft::State> onReceiveRPC() override { return nullptr; }
-};
-
 
 
 ////////////////////////////////// Config and Test //////////////////////////////////
@@ -300,7 +305,7 @@ inline Raft::Raft(Config &config, int id)
     : _self(config._peers[id]),
       _id(id),
       _currentTerm(0),
-      _flags(FLAGS_FOLLOWER)
+      _fsm(std::make_shared<Follower>(this))
 {
     for(size_t i = 0; i < config._peers.size(); i++) {
         if(i != id) _peers.emplace_back(config._peers[i]);
@@ -377,26 +382,35 @@ inline std::shared_ptr<Raft> Raft::make(Config &config, int id) {
 }
 
 inline auto Raft::getState() {
-    return std::make_tuple(_currentTerm, bool(_flags & FLAGS_LEADER));
+    return std::make_tuple(_currentTerm, bool(_fsm->flags() & FLAGS_FOLLOWER));
 }
 
 inline Reply<int, bool> Raft::appendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
+    return _fsm->onReceiveAppendEntryRPC(term, leaderId, prevLogIndex, prevLogTerm);
 }
 
 inline Reply<int, bool> Raft::requestVoteRPC(int term, int candidateId /*...*/) {
-    // reject stale request
-    if(term < _currentTerm) {
-        return std::make_tuple(_currentTerm, false);
-    }
 
-    // TODO check stale leader?
+    return _fsm->onReceiveRequestVoteRPC(term, candidateId);
+}
 
-    bool voteGranted = false;
-    if(!_voteFor || *_voteFor == candidateId) {
-        _voteFor = candidateId;
-        voteGranted = true;
-    }
-    return std::make_tuple(_currentTerm, voteGranted);
+template <typename NextState>
+inline void Raft::become() {
+    auto previous = std::move(_fsm);
+    _fsm = std::make_shared<NextState>(this);
+    _fsm->onBecome(std::move(previous));
+}
+
+inline void Raft::becomeLeader() {
+    become<Leader>();
+}
+
+inline void Raft::becomeFollower() {
+    become<Follower>();
+}
+
+inline void Raft::becomeCandidate() {
+    become<Candidate>();
 }
 
 inline void Raft::performElection() {
@@ -420,12 +434,25 @@ inline void Raft::performElection() {
                 // TODO print endpoint
                 CXXRAFT_LOG_DEBUG("no reply in client");
             }
+
+            // While waiting for votes, a candidate may receive an
+            // AppendEntries RPC from another server claiming to be
+            // leader.
+            // If the leader’s term (included in its RPC) is at least
+            // as large as the candidate’s current term, then the candidate
+            // recognizes the leader as legitimate and returns to follower
+            // state.
+            // If the term in the RPC is smaller than the candidate’s
+            // current term, then the candidate rejects the RPC and continues in candidate state.
+
             auto [term, voteGranted] = reply->cast();
             if(!voteGranted) {
                 CXXRAFT_LOG_DEBUG("vote rejected");
             }
-            // if(term < _...)
-            // if term ?
+            if(term < _currentTerm) {
+                continue;
+            }
+
             voted++;
         }
     }
@@ -540,5 +567,106 @@ inline int Config::checkTerms() {
     }
     return term;
 }
+
+
+
+
+struct Leader: public Raft::State {
+
+    Leader(Raft *master): Raft::State(master) { _flags |= Raft::FLAGS_LEADER; };
+
+    Raft::Bitmask type() override { return Raft::FLAGS_LEADER; }
+    const char* type(Raft::State::Literal) override { return "leader"; }
+
+    void onBecome(std::shared_ptr<Raft::State> previous) override {
+        // TODO abort pending jobs in previous state?
+        // master->abort...()
+        // it can be simplified...
+        // because we are in the same coroutine environment
+        // jobs in worker queue are all pending
+        // for(auto &&client: ...) client.worker.strike();
+
+        // start leader job
+        // example: appendEntry
+        // master->perform...()
+    }
+
+    void onNotReceiveRPC() override { /*nop*/ }
+
+    Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
+    Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) override {
+
+        // TODO return _master->performLeaderReceiveRequestVote...
+
+        // reject stale request
+        if(term < _master->_currentTerm) {
+            return std::make_tuple(_master->_currentTerm, false);
+        }
+
+        // TODO check stale leader?
+        // if(term > _master->_currentTerm) {
+        //     // post(Later{}, becomFollower) ?
+        //     _master->becomeFollower();
+        //     return ?
+        // }
+    }
+};
+
+struct Follower: public Raft::State {
+
+    Follower(Raft *master): Raft::State(master) { _flags |= Raft::FLAGS_FOLLOWER; }
+
+    Raft::Bitmask type() override { return Raft::FLAGS_FOLLOWER; }
+    const char* type(Raft::State::Literal) override { return "follower"; }
+
+    void onBecome(std::shared_ptr<Raft::State> previous) override {
+
+        // waiting for valid rpc or forward upper request to leader
+    }
+
+    void onNotReceiveRPC() override {
+
+        // abort pending
+
+        // or emplace back?
+
+        _master->becomeCandidate();
+
+    }
+
+    Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
+    Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) override {
+        // reject stale request
+        if(term < _master->_currentTerm) {
+            return std::make_tuple(_master->_currentTerm, false);
+        }
+
+        bool voteGranted = false;
+        if(!_master->_voteFor || *_master->_voteFor == candidateId) {
+            _master->_voteFor = candidateId;
+            voteGranted = true;
+        }
+        return std::make_tuple(_master->_currentTerm, voteGranted);
+    }
+};
+
+
+struct Candidate: public Raft::State {
+
+    Candidate(Raft *master): Raft::State(master) { _flags |= Raft::FLAGS_CANDIDATE; }
+
+    Raft::Bitmask type() override { return Raft::FLAGS_CANDIDATE; }
+    const char* type(Raft::State::Literal) override { return "candidate"; }
+
+    void onBecome(std::shared_ptr<Raft::State> previous) override {
+
+        _master->performElection();
+    }
+
+    void onNotReceiveRPC() override { /*nop*/ }
+
+    Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
+    Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) override;
+};
 
 } // cxxraft
