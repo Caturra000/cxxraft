@@ -96,14 +96,27 @@ private:
     void becomeCandidate();
 
 // perform can be called by state machine only
+// all perform functions should be executed endless
 private:
 
-    // return: voted
-    std::shared_ptr<int> performElection();
+    void performElection();
 
     // Waiting for any RPC response
     // If failed, follower will be converted to candidate
-    void performKeepAlive(size_t *watchdog);
+    void performKeepAlive(std::shared_ptr<size_t> watchdog);
+
+    void performHeartBeat(std::shared_ptr<bool> abortFlag);
+
+private:
+
+    // Least majority of fixed-size cluster
+    size_t majority();
+
+    // used in performElection()
+    // return: voted
+    std::shared_ptr<int> prepareElection();
+
+    void sendHeartBeat(std::shared_ptr<bool> abortFlag);
 
 public:
 
@@ -116,10 +129,16 @@ public:
     using AppendEntryReply = Reply<int, bool>;
     using RequestVoteReply = Reply<int, bool>;
 
+    // @paper
+    //
     // Raft uses randomized election timeouts to ensure that
     // split votes are rare and that they are resolved quickly. To
     // prevent split votes in the first place, election timeouts are
     // chosen randomly from a fixed interval (e.g., 150–300ms)
+    //
+    // @refs
+    //
+    // MIT-6.824 recommends that 1 second is better
     constexpr static auto RAFT_ELECTION_TIMEOUT
         { std::chrono::milliseconds(300) };
 
@@ -128,6 +147,11 @@ public:
 
     constexpr static auto RAFT_ELECTION_TIMEOUT_MAX
         { std::chrono::milliseconds(300) };
+
+    // Same as etcd-raft heartbeat interval
+    // (less than RAFT_ELECTION_TIMEOUT_MIN)
+    constexpr static auto RAFT_HEARTBEAT_INTERVAL
+        { std::chrono::milliseconds(100) };
 
     using Bitmask = uint64_t;
 
@@ -168,9 +192,6 @@ public:
     // (c) a period of time goes by with no winner.
     constexpr static Bitmask FLAGS_CANDIDATE  = 1ULL << 3;
 
-    // TODO same as FLAGS_CANDIDATE?
-    constexpr static Bitmask FLAGS_WAITING_FOR_VOTE = 1ULL << 4;
-
 private:
 
     trpc::Endpoint _self;
@@ -185,6 +206,8 @@ private:
     // Log or configuration
     Storage _storage;
 
+    // @paper
+    //
     // Each server stores a current term number,
     // which increases monotonically over time
     //
@@ -205,15 +228,11 @@ private:
     // // TODO
     // int _lastApplied {};
 
-    // Bitmask _flags;
-
-    // TODO idle worker
-
     // Finite State Machine
     std::shared_ptr<State> _fsm;
 
-    // a coroutine where fsm runs on
-    Worker _controller;
+    // a coroutine where FSM runs on
+    Worker _transitioner;
 
 private:
 
@@ -234,18 +253,22 @@ private:
 
 
 
-// TODO optional interface
 struct Raft::State {
+
+public:
+
+    // Tag class
+    // Return string literal
     struct Literal {};
 
-    State(Raft *master): _master{master}, _flags{} {}
+    State(Raft *master): _master{master}, _flags{}, _access{} {}
 
     virtual Raft::Bitmask type() { return 0; };
     virtual const char*   type(Literal) { return "unknown"; }
     virtual Raft::Bitmask flags() { return _flags; }
     virtual const char*   flags(Literal) { return "TODO"; }
 
-    // it runs on the `_controller` coroutine
+    // it runs on the `_transitioner` coroutine
     virtual void onBecome(std::shared_ptr<Raft::State> previous) = 0;
 
     // runs on a RPC server coroutine
@@ -254,9 +277,29 @@ struct Raft::State {
     // runs on a RPC server coroutine
     virtual Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) = 0;
 
+// enable / disable operations
+// avoid conflicts of asynchronous state transitions
+public:
+    using Accessible = uint64_t;
+    constexpr static Accessible ACCESS_ON_BECOME_DISABLED = 1LL << 1;
+    constexpr static Accessible ACCESS_ON_RECEIVE_APPEND_ENTRY_RPC_DISABLED = 1LL << 2;
+    constexpr static Accessible ACCESS_ON_RECEIVE_REQUEST_VOTE_RPC_DISABLED = 1LL << 3;
+    // TODO rejectTransitRequest
+    void disableOnBecome() {_access |= ACCESS_ON_BECOME_DISABLED;}
+    void disableOnReceiveAppendEntryRPC() {_access |= ACCESS_ON_RECEIVE_APPEND_ENTRY_RPC_DISABLED;}
+    void disableOnReceiveRequestVoteRPC() {_access |= ACCESS_ON_RECEIVE_REQUEST_VOTE_RPC_DISABLED;}
+    void enableOnBecome() {_access &= ~ACCESS_ON_BECOME_DISABLED;}
+    void enableOnReceiveAppendEntryRPC() {_access &= ~ACCESS_ON_RECEIVE_APPEND_ENTRY_RPC_DISABLED;}
+    void enableOnReceiveRequestVoteRPC() {_access &= ~ACCESS_ON_RECEIVE_REQUEST_VOTE_RPC_DISABLED;}
+    bool onBecomeEnabled() {return !(_access & ACCESS_ON_BECOME_DISABLED);}
+    bool onReceiveAppendEntryRPCEnabled() {return !(_access & ACCESS_ON_RECEIVE_APPEND_ENTRY_RPC_DISABLED);}
+    bool onReceiveRequestVoteRPCEnabled() {return !(_access & ACCESS_ON_RECEIVE_REQUEST_VOTE_RPC_DISABLED);}
+
 protected:
     Raft *_master;
     Raft::Bitmask _flags;
+    Accessible _access;
+
 };
 
 
@@ -360,27 +403,13 @@ inline void Raft::start() {
         _rpcServer->start();
     })->resume();
 
-    // coroutine1~N: client
-    // TODO remove code
-    // check bool(client)
-    for(size_t i = 0; i < _peers.size(); ++i) {
-
-        _peers[i].proactive.post([this, i] {
-            auto &client = _peers[i].client;
-            client = trpc::Client::make(_peers[i].endpoint);
-
-            if(!client) {
-                CXXRAFT_LOG_WARN("client", i, "start failed.");
-                return;
-            }
-        });
-    }
-
-    // coroutineN+1 : state machine control
-    _controller.post([this] {
+    // coroutine1: state machine transitions
+    _transitioner.post([this] {
         // preivous state == nullptr
         becomeFollower();
     });
+
+    // client coroutines will start in further state
 }
 
 inline std::shared_ptr<Raft> Raft::make(Config &config, int id) {
@@ -422,76 +451,38 @@ inline void Raft::becomeCandidate() {
     become<Candidate>();
 }
 
-inline std::shared_ptr<int> Raft::performElection() {
+inline void Raft::performElection() {
+    CXXRAFT_LOG_DEBUG("perform election, node id:", _id);
+    std::random_device rd;
+    std::mt19937 engine(rd());
+    using ToMicro = std::chrono::duration<useconds_t, std::micro>;
+    std::uniform_int_distribution<> dist(
+        ToMicro{Raft::RAFT_ELECTION_TIMEOUT_MIN}.count(),
+        ToMicro{Raft::RAFT_ELECTION_TIMEOUT_MAX}.count()
+    );
 
-    // To begin an election, a follower increments its current
-    // term and transitions to candidate state
-    _currentTerm++;
-
-    // It then votes for itself and
-    // issues RequestVote RPCs in parallel to each of
-    // the other servers in the cluster.
-    //
-    // (voted == -1) means aborted
-    auto voted = std::make_shared<int>(1);
-
-    auto gatherVote = [this, currentTerm = _currentTerm, voted](int index) {
-        // abort
-        if(*voted == -1) return;
-        // optimize
-        if(*voted > (1 + _peers.size()) / 2) return;
-
-        auto &peer = _peers[index];
-
-        // Try to connect to a raft node
-        // (Although it is a long connection, it may crash before)
-        //
-        // It may be unavailable and make() / connect() spends a lot of time
-        // But we can run this `gatherVote` on many client coroutines
-        // While `performElection` runs on fsm coroutine
-        if(!peer.client && !(peer.client = trpc::Client::make(peer.endpoint))) {
-            return;
+    while(1) {
+        auto voting = prepareElection();
+        // if failed, wait for a while
+        co::usleep(dist(engine));
+        int voted = *voting;
+        // abort!
+        *voting = -1;
+        if(voted >= majority()) {
+            break;
         }
-
-        auto reply = peer.client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, currentTerm, _id, 0, 0);
-
-        if(!reply) {
-            // TODO print endpoint
-            CXXRAFT_LOG_DEBUG("no reply in client");
-        }
-
-        // While waiting for votes, a candidate may receive an
-        // AppendEntries RPC from another server claiming to be
-        // leader.
-        // If the leader’s term (included in its RPC) is at least
-        // as large as the candidate’s current term, then the candidate
-        // recognizes the leader as legitimate and returns to follower
-        // state.
-        // If the term in the RPC is smaller than the candidate’s
-        // current term, then the candidate rejects the RPC and continues in candidate state.
-
-        auto [term, voteGranted] = reply->cast();
-        if(!voteGranted) {
-            CXXRAFT_LOG_DEBUG("vote rejected");
-        }
-        // `_currentTerm`, not `currentTerm`
-        if(term < _currentTerm) {
-            return;
-        }
-
-        (*voted)++;
-    };
-
-    // don't use for-each &&
-    for(size_t i = 0; i < _peers.size(); ++i) {
-        _peers[i].proactive.post([=] {gatherVote(i);});
     }
 
-    return voted;
+    CXXRAFT_LOG_DEBUG("post: candidate -> leader. node id:", _id);
+
+    // See performKeepAlive
+    _transitioner.post([this] {
+        becomeLeader();
+    });
 }
 
-inline void Raft::performKeepAlive(size_t *watchdog) {
-    CXXRAFT_LOG_DEBUG("follower keepalive, node id:", _id);
+inline void Raft::performKeepAlive(std::shared_ptr<size_t> watchdog) {
+    CXXRAFT_LOG_DEBUG("perform keepalive, node id:", _id);
     while(1) {
         size_t old = *watchdog;
         co::usleep(std::chrono::duration<useconds_t, std::micro>(
@@ -506,9 +497,157 @@ inline void Raft::performKeepAlive(size_t *watchdog) {
 
     CXXRAFT_LOG_DEBUG("post: follower -> candidate. node id:", _id);
     // waiting RPC for a long time
-    _controller.post([this] {
+    _transitioner.post([this] {
+        // We cannot call this function without post()
+        // Because state transitions are implicit recursive
+        // They will rasise stackoverflow
         becomeCandidate();
     });
+}
+
+inline void Raft::performHeartBeat(std::shared_ptr<bool> abortFlag) {
+    CXXRAFT_LOG_DEBUG("perform heart beat, node id:", _id);
+    while(!*abortFlag) {
+        sendHeartBeat(abortFlag);
+        co::usleep(std::chrono::duration<useconds_t, std::micro>(
+            RAFT_HEARTBEAT_INTERVAL).count());
+    }
+    // TODO become...
+}
+
+inline size_t Raft::majority() {
+    return (1 + _peers.size()) / 2 + 1;
+}
+
+inline std::shared_ptr<int> Raft::prepareElection() {
+
+    // @paper
+    //
+    // To begin an election, a follower increments its current
+    // term and transitions to candidate state
+    _currentTerm++;
+
+    // @paper
+    //
+    // It then votes for itself and
+    // issues RequestVote RPCs in parallel to each of
+    // the other servers in the cluster.
+
+    // (voted == -1) means aborted
+    // 1: vote for itself
+    auto voted = std::make_shared<int>(1);
+
+    auto gatherVote = [this, currentTerm = _currentTerm, voted](int index) {
+
+        auto &peer = _peers[index];
+
+        // clean up pending jobs
+        peer.proactive.strike();
+
+        // abort or optimize
+        if(*voted == -1 || *voted >= majority()) {
+            return;
+        }
+
+
+        // Try to connect to a raft node
+        // (Although it is a long connection, it may crash before)
+        //
+        // It may be unavailable and make() / connect() spends a lot of time
+        // But we can run this `gatherVote` on many client coroutines
+        // While `prepareElection` runs on fsm coroutine
+        bool reconnect = !peer.client || (peer.client && peer.client->fd() < 0);
+
+        // what happened?
+        if(reconnect && !(peer.client = trpc::Client::make(peer.endpoint))) {
+            return;
+        }
+
+        auto reply = peer.client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, currentTerm, _id);
+
+        // check again after network IO
+        if(*voted == -1 || *voted >= majority()) {
+            return;
+        }
+
+        if(!reply) {
+            // TODO print endpoint
+            CXXRAFT_LOG_DEBUG("no reply in client");
+            return;
+        }
+
+        // @paper
+        //
+        // While waiting for votes, a candidate may receive an
+        // AppendEntries RPC from another server claiming to be
+        // leader.
+        // If the leader’s term (included in its RPC) is at least
+        // as large as the candidate’s current term, then the candidate
+        // recognizes the leader as legitimate and returns to follower
+        // state.
+        // If the term in the RPC is smaller than the candidate’s
+        // current term, then the candidate rejects the RPC and continues in candidate state.
+
+        auto [term, voteGranted] = reply->cast();
+
+
+        if(!voteGranted) {
+            CXXRAFT_LOG_DEBUG("vote rejected");
+            return;
+        }
+        // `_currentTerm`, not `currentTerm`
+        if(term < _currentTerm) {
+            return;
+        }
+
+        (*voted)++;
+
+        // @paper
+        //
+        // A candidate wins an election if it receives votes from
+        // a majority of the servers in the full cluster for the same
+        // term.
+
+        // Question. what about term > _currentTerm ?
+    };
+
+    // don't use for-each &&
+    for(size_t i = 0; i < _peers.size(); ++i) {
+        _peers[i].proactive.post([=] {gatherVote(i);});
+    }
+
+    return voted;
+}
+
+inline void Raft::sendHeartBeat(std::shared_ptr<bool> abortFlag) {
+
+    if(*abortFlag) return;
+
+    auto send = [this, currentTerm = _currentTerm, abortFlag](int index) {
+        auto &peer = _peers[index];
+        peer.proactive.strike();
+
+        if(*abortFlag) return;
+
+        // See prepareElection()
+        bool reconnect = !peer.client || (peer.client && peer.client->fd() < 0);
+
+        if(reconnect && !(peer.client = trpc::Client::make(peer.endpoint))) {
+            return;
+        }
+
+        auto reply = peer.client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm,_id, 0, 0);
+
+        if(!reply) {
+            CXXRAFT_LOG_DEBUG("no reply in client");
+        }
+    };
+
+    for(size_t i = 0; i < _peers.size(); ++i) {
+        _peers[i].proactive.post([=] {
+            send(i);
+        });
+    }
 }
 
 inline Config::Config(std::vector<trpc::Endpoint> peers)
@@ -625,12 +764,21 @@ inline int Config::checkTerms() {
 
 struct Leader: public Raft::State {
 
-    Leader(Raft *master): Raft::State(master) { _flags |= Raft::FLAGS_LEADER; };
+    Leader(Raft *master)
+        : Raft::State(master),
+          _abortHeatBeat{std::make_shared<bool>(false)}
+    {
+        _flags |= Raft::FLAGS_LEADER;
+    };
 
     Raft::Bitmask type() override { return Raft::FLAGS_LEADER; }
     const char* type(Raft::State::Literal) override { return "leader"; }
 
     void onBecome(std::shared_ptr<Raft::State> previous) override {
+
+
+        _master->performHeartBeat(_abortHeatBeat);
+
         // TODO abort pending jobs in previous state?
         // master->abort...()
         // it can be simplified...
@@ -643,7 +791,9 @@ struct Leader: public Raft::State {
         // master->perform...()
     }
 
-    Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
+    Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override {
+        return std::make_tuple(_master->_currentTerm, false);
+    }
     Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) override {
 
         // TODO return _master->performLeaderReceiveRequestVote...
@@ -660,23 +810,31 @@ struct Leader: public Raft::State {
         //     return ?
         // }
     }
+
+private:
+    std::shared_ptr<bool> _abortHeatBeat;
 };
 
 struct Follower: public Raft::State {
 
-    Follower(Raft *master): Raft::State(master) { _flags |= Raft::FLAGS_FOLLOWER; }
+    Follower(Raft *master)
+        : Raft::State(master),
+          _watchdog(std::make_shared<size_t>(0))
+    {
+        _flags |= Raft::FLAGS_FOLLOWER;
+    }
 
     Raft::Bitmask type() override { return Raft::FLAGS_FOLLOWER; }
     const char* type(Raft::State::Literal) override { return "follower"; }
 
-    // running on a control coroutine (N+1)
+    // running on a transitioner coroutine (1)
     void onBecome(std::shared_ptr<Raft::State> previous) override {
-        _master->performKeepAlive(&_watchdog);
+        _master->performKeepAlive(_watchdog);
     }
 
     // running on a RPC coroutine (0)
     Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override {
-        ++_watchdog;
+        ++(*_watchdog);
 
         // TODO
 
@@ -684,7 +842,7 @@ struct Follower: public Raft::State {
     }
 
     Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) override {
-        ++_watchdog;
+        ++(*_watchdog);
 
         // reject stale request
         if(term < _master->_currentTerm) {
@@ -700,7 +858,7 @@ struct Follower: public Raft::State {
     }
 
 private:
-    size_t _watchdog {};
+    std::shared_ptr<size_t> _watchdog;
 };
 
 
@@ -712,35 +870,37 @@ struct Candidate: public Raft::State {
     const char* type(Raft::State::Literal) override { return "candidate"; }
 
     void onBecome(std::shared_ptr<Raft::State> previous) override {
-
-        std::random_device rd;
-        std::mt19937 engine(rd());
-        using ToMicro = std::chrono::duration<useconds_t, std::micro>;
-        std::uniform_int_distribution<> dist(
-            ToMicro{Raft::RAFT_ELECTION_TIMEOUT_MIN}.count(),
-            ToMicro{Raft::RAFT_ELECTION_TIMEOUT_MAX}.count()
-        );
-
-        bool win = false;
-        while(1) {
-            auto voting = _master->performElection();
-            // if failed, wait a while
-            co::usleep(dist(engine));
-            int voted = *voting;
-            // abort!
-            *voting = -1;
-            if(voted > (1 + _master->_peers.size()) / 2) {
-                win = true;
-                break;
-            }
-        }
-
-        if(win) {
-            _master->becomeLeader();
-        }
+        _master->performElection();
+        // TODO block onReceiveAppendEntryRPC and onReceiveRequestVoteRPC
     }
 
-    Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
+    Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override {
+        // @paper
+        //
+        // While waiting for votes, a candidate may receive an
+        // AppendEntries RPC from another server claiming to be
+        // leader. If the leader’s term (included in its RPC) is at least
+        // as large as the candidate’s current term, then the candidate
+        // recognizes the leader as legitimate and returns to follower
+        // state.
+
+        if(term >= _master->_currentTerm) {
+            // FIXME. not 100% safe
+            // TODO
+            // If we post a become-operation,
+            // we should abort other ways to post become-operations
+            _master->_transitioner.post([this] {
+                _master->becomeFollower();
+            });
+            return std::make_tuple(_master->_currentTerm, true);
+        }
+
+        // @paper
+        //
+        // If the term in the RPC is smaller than the candidate’s current term,
+        // then the candidate rejects the RPC and continues in candidate state
+        return std::make_tuple(_master->_currentTerm, false);
+    }
     Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) override;
 };
 
