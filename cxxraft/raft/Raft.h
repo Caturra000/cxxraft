@@ -1,6 +1,7 @@
 #pragma once
 #include <random>
 #include <memory>
+#include <cstdlib>
 #include <tuple>
 #include <vector>
 #include <optional>
@@ -105,7 +106,7 @@ private:
     // If failed, follower will be converted to candidate
     void performKeepAlive(std::shared_ptr<size_t> watchdog);
 
-    void performHeartBeat(std::shared_ptr<bool> abortFlag);
+    void performHeartBeat();
 
 private:
 
@@ -116,7 +117,11 @@ private:
     // return: voted
     std::shared_ptr<int> prepareElection();
 
-    void sendHeartBeat(std::shared_ptr<bool> abortFlag);
+    void sendHeartBeat();
+
+    size_t getTransaction();
+
+    bool isValidTransaction(size_t transaction);
 
 public:
 
@@ -231,8 +236,17 @@ private:
     // Finite State Machine
     std::shared_ptr<State> _fsm;
 
-    // a coroutine where FSM runs on
+    // A coroutine where FSM runs on
     Worker _transitioner;
+
+    // A transaction ID for state machine
+    // When invokes become...(), _transaction will add one
+    // and pending coroutines will know themselves are outdated and then abort
+    //
+    // _transaction will be checked in every context switch
+    //
+    // _transaction and _currentTerm are not strictly related
+    size_t _transaction;
 
 private:
 
@@ -262,12 +276,18 @@ public:
     // Return string literal
     struct Literal {};
 
-    State(Raft *master): _master{master}, _flags{}, _access{} {}
+    State(Raft *master)
+        : _master{master},
+          _flags{},
+          _transaction(master->getTransaction())
+    {}
 
     virtual Raft::Bitmask type() { return 0; };
     virtual const char*   type(Literal) { return "unknown"; }
     virtual Raft::Bitmask flags() { return _flags; }
     virtual const char*   flags(Literal) { return "TODO"; }
+
+    bool isValidTransaction() { return _master->isValidTransaction(_transaction); }
 
     // it runs on the `_transitioner` coroutine
     virtual void onBecome(std::shared_ptr<Raft::State> previous) = 0;
@@ -278,28 +298,10 @@ public:
     // runs on a RPC server coroutine
     virtual Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) = 0;
 
-// enable / disable operations
-// avoid conflicts of asynchronous state transitions
-public:
-    using Accessible = uint64_t;
-    constexpr static Accessible ACCESS_ON_BECOME_DISABLED = 1LL << 1;
-    constexpr static Accessible ACCESS_ON_RECEIVE_APPEND_ENTRY_RPC_DISABLED = 1LL << 2;
-    constexpr static Accessible ACCESS_ON_RECEIVE_REQUEST_VOTE_RPC_DISABLED = 1LL << 3;
-    // TODO rejectTransitRequest
-    void disableOnBecome() {_access |= ACCESS_ON_BECOME_DISABLED;}
-    void disableOnReceiveAppendEntryRPC() {_access |= ACCESS_ON_RECEIVE_APPEND_ENTRY_RPC_DISABLED;}
-    void disableOnReceiveRequestVoteRPC() {_access |= ACCESS_ON_RECEIVE_REQUEST_VOTE_RPC_DISABLED;}
-    void enableOnBecome() {_access &= ~ACCESS_ON_BECOME_DISABLED;}
-    void enableOnReceiveAppendEntryRPC() {_access &= ~ACCESS_ON_RECEIVE_APPEND_ENTRY_RPC_DISABLED;}
-    void enableOnReceiveRequestVoteRPC() {_access &= ~ACCESS_ON_RECEIVE_REQUEST_VOTE_RPC_DISABLED;}
-    bool onBecomeEnabled() {return !(_access & ACCESS_ON_BECOME_DISABLED);}
-    bool onReceiveAppendEntryRPCEnabled() {return !(_access & ACCESS_ON_RECEIVE_APPEND_ENTRY_RPC_DISABLED);}
-    bool onReceiveRequestVoteRPCEnabled() {return !(_access & ACCESS_ON_RECEIVE_REQUEST_VOTE_RPC_DISABLED);}
-
 protected:
     Raft *_master;
     Raft::Bitmask _flags;
-    Accessible _access;
+    size_t _transaction;
 
 };
 
@@ -315,8 +317,6 @@ struct Leader: public Raft::State {
     Reply<int, bool> onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
     Reply<int, bool> onReceiveRequestVoteRPC(int term, int candidateId) override;
 
-private:
-    std::shared_ptr<bool> _abortHeatBeat;
 };
 
 struct Follower: public Raft::State {
@@ -422,7 +422,8 @@ inline Raft::Raft(Config &config, int id)
     : _self(config._peers[id]),
       _id(id),
       _currentTerm(0),
-      _fsm(nullptr)
+      _fsm(nullptr),
+      _transaction(0)
 {
     for(size_t i = 0; i < config._peers.size(); i++) {
         if(i != id) _peers.emplace_back(config._peers[i]);
@@ -442,6 +443,9 @@ inline void Raft::start() {
         CXXRAFT_LOG_WARN("server start failed.");
         return;
     }
+
+    // NOTE: `this` pointer will be moved in move semantic
+    // you should construct raft object by make()
 
     _rpcServer->bind(RAFT_APPEND_ENTRY_RPC, [this](int term, int leaderId, int prevLogIndex, int prevLogTerm) {
         return this->appendEntryRPC(term, leaderId, prevLogIndex, prevLogTerm);
@@ -488,6 +492,7 @@ inline Reply<int, bool> Raft::requestVoteRPC(int term, int candidateId /*...*/) 
 template <typename NextState>
 inline void Raft::become() {
     auto previous = std::move(_fsm);
+    _transaction++;
     _fsm = std::make_shared<NextState>(this);
     _fsm->onBecome(std::move(previous));
 }
@@ -508,6 +513,9 @@ inline void Raft::becomeCandidate() {
 }
 
 inline void Raft::performElection() {
+
+    const auto transaction = getTransaction();
+
     CXXRAFT_LOG_DEBUG("perform election, node id:", _id);
     std::random_device rd;
     std::mt19937 engine(rd());
@@ -517,7 +525,7 @@ inline void Raft::performElection() {
         ToMicro{Raft::RAFT_ELECTION_TIMEOUT_MAX}.count()
     );
 
-    while(1) {
+    while(isValidTransaction(transaction)) {
         auto voting = prepareElection();
         // if failed, wait for a while
         co::usleep(dist(engine));
@@ -529,6 +537,10 @@ inline void Raft::performElection() {
         }
     }
 
+    if(!isValidTransaction(transaction)) {
+        return;
+    }
+
     CXXRAFT_LOG_DEBUG("post: candidate -> leader. node id:", _id);
 
     // See performKeepAlive
@@ -538,8 +550,9 @@ inline void Raft::performElection() {
 }
 
 inline void Raft::performKeepAlive(std::shared_ptr<size_t> watchdog) {
+    const auto transaction = getTransaction();
     CXXRAFT_LOG_DEBUG("perform keepalive, node id:", _id);
-    while(1) {
+    while(isValidTransaction(transaction)) {
         size_t old = *watchdog;
         co::usleep(std::chrono::duration<useconds_t, std::micro>(
             Raft::RAFT_ELECTION_TIMEOUT_MAX).count());
@@ -551,20 +564,25 @@ inline void Raft::performKeepAlive(std::shared_ptr<size_t> watchdog) {
         // else keep follower
     }
 
+    if(!isValidTransaction(transaction)) {
+        return;
+    }
+
     CXXRAFT_LOG_DEBUG("post: follower -> candidate. node id:", _id);
     // waiting RPC for a long time
     _transitioner.post([this] {
         // We cannot call this function without post()
         // Because state transitions are implicit recursive
-        // They will rasise stackoverflow
+        // They will raise stackoverflow
         becomeCandidate();
     });
 }
 
-inline void Raft::performHeartBeat(std::shared_ptr<bool> abortFlag) {
+inline void Raft::performHeartBeat() {
+    const auto transaction = getTransaction();
     CXXRAFT_LOG_DEBUG("perform heart beat, node id:", _id);
-    while(!*abortFlag) {
-        sendHeartBeat(abortFlag);
+    while(isValidTransaction(transaction)) {
+        sendHeartBeat();
         co::usleep(std::chrono::duration<useconds_t, std::micro>(
             RAFT_HEARTBEAT_INTERVAL).count());
     }
@@ -576,6 +594,8 @@ inline size_t Raft::majority() {
 }
 
 inline std::shared_ptr<int> Raft::prepareElection() {
+
+    const auto transaction = getTransaction();
 
     // @paper
     //
@@ -593,7 +613,11 @@ inline std::shared_ptr<int> Raft::prepareElection() {
     // 1: vote for itself
     auto voted = std::make_shared<int>(1);
 
-    auto gatherVote = [this, currentTerm = _currentTerm, voted](int index) {
+    auto gatherVote = [this, currentTerm = _currentTerm, voted, transaction](int index) {
+
+        if(!isValidTransaction(transaction)) {
+            return;
+        }
 
         auto &peer = _peers[index];
 
@@ -601,7 +625,7 @@ inline std::shared_ptr<int> Raft::prepareElection() {
         peer.proactive.strike();
 
         // abort or optimize
-        if(*voted == -1 || *voted >= majority()) {
+        if(auto v = *voted; v == -1 || v >= majority()) {
             return;
         }
 
@@ -619,10 +643,18 @@ inline std::shared_ptr<int> Raft::prepareElection() {
             return;
         }
 
+        if(!isValidTransaction(transaction)) {
+            return;
+        }
+
         auto reply = peer.client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, currentTerm, _id);
 
+        if(!isValidTransaction(transaction)) {
+            return;
+        }
+
         // check again after network IO
-        if(*voted == -1 || *voted >= majority()) {
+        if(auto v = *voted; v == -1 || v >= majority()) {
             return;
         }
 
@@ -675,15 +707,17 @@ inline std::shared_ptr<int> Raft::prepareElection() {
     return voted;
 }
 
-inline void Raft::sendHeartBeat(std::shared_ptr<bool> abortFlag) {
+inline void Raft::sendHeartBeat() {
 
-    if(*abortFlag) return;
+    const auto transaction = getTransaction();
 
-    auto send = [this, currentTerm = _currentTerm, abortFlag](int index) {
+
+    auto send = [this, currentTerm = _currentTerm, transaction](int index) {
+
+        if(!isValidTransaction(transaction)) return;
+
         auto &peer = _peers[index];
         peer.proactive.strike();
-
-        if(*abortFlag) return;
 
         // See prepareElection()
         bool reconnect = !peer.client || (peer.client && peer.client->fd() < 0);
@@ -692,7 +726,11 @@ inline void Raft::sendHeartBeat(std::shared_ptr<bool> abortFlag) {
             return;
         }
 
+        if(!isValidTransaction(transaction)) return;
+
         auto reply = peer.client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm,_id, 0, 0);
+
+        if(!isValidTransaction(transaction)) return;
 
         if(!reply) {
             CXXRAFT_LOG_DEBUG("no reply in client");
@@ -700,10 +738,16 @@ inline void Raft::sendHeartBeat(std::shared_ptr<bool> abortFlag) {
     };
 
     for(size_t i = 0; i < _peers.size(); ++i) {
-        _peers[i].proactive.post([=] {
-            send(i);
-        });
+        _peers[i].proactive.post([=] { send(i); });
     }
+}
+
+inline size_t Raft::getTransaction() {
+    return _transaction;
+}
+
+inline bool Raft::isValidTransaction(size_t transaction) {
+    return _transaction == transaction;
 }
 
 inline Config::Config(std::vector<trpc::Endpoint> peers)
@@ -816,49 +860,60 @@ inline int Config::checkTerms() {
 }
 
 inline Leader::Leader(Raft *master)
-    : Raft::State(master),
-        _abortHeatBeat{std::make_shared<bool>(false)}
+    : Raft::State(master)
 {
     _flags |= Raft::FLAGS_LEADER;
 }
 
 inline void Leader::onBecome(std::shared_ptr<Raft::State> previous) {
-
-    _master->performHeartBeat(_abortHeatBeat);
-
-    // TODO abort pending jobs in previous state?
-    // master->abort...()
-    // it can be simplified...
-    // because we are in the same coroutine environment
-    // jobs in worker queue are all pending
-    // for(auto &&client: ...) client.worker.strike();
-
-    // start leader job
-    // example: appendEntry
-    // master->perform...()
+    _master->performHeartBeat();
 }
 
 inline Reply<int, bool> Leader::onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
+
+    // currently peers don't care about the reply
+
+    if(!isValidTransaction()) {
+        return std::make_tuple(_master->_currentTerm, false);
+    }
+
+    // World has changed
+    if(term > _master->_currentTerm) {
+        _master->_transitioner.post([master = this->_master] {
+            master->becomeFollower();
+        });
+        return std::make_tuple(_master->_currentTerm, true);
+    } else if(term == _master->_currentTerm) {
+        CXXRAFT_LOG_WTF("I am the only leader in this term, you too?");
+    }
     return std::make_tuple(_master->_currentTerm, false);
 }
 
 inline Reply<int, bool> Leader::onReceiveRequestVoteRPC(int term, int candidateId) {
 
-    // TODO return _master->performLeaderReceiveRequestVote...
+    if(!isValidTransaction()) {
+        return std::make_tuple(_master->_currentTerm, false);
+    }
 
     // reject stale request
     if(term < _master->_currentTerm) {
         return std::make_tuple(_master->_currentTerm, false);
     }
 
-    // TODO check stale leader?
-    // if(term > _master->_currentTerm) {
-    //     // post(Later{}, becomFollower) ?
-    //     _master->becomeFollower();
-    //     return ?
-    // }
+    // check stale leader
+    if(term > _master->_currentTerm) {
+        _master->_transitioner.post([master = this->_master] {
+            master->becomeFollower();
+        });
+    }
 
-    return std::make_tuple(_master->_currentTerm, false);
+    bool voteGranted = false;
+    if(!_master->_voteFor || *_master->_voteFor == candidateId) {
+        _master->_voteFor = candidateId;
+        voteGranted = true;
+    }
+
+    return std::make_tuple(_master->_currentTerm, voteGranted);
 }
 
 inline Follower::Follower(Raft *master)
@@ -873,6 +928,11 @@ inline void Follower::onBecome(std::shared_ptr<Raft::State> previous) {
 }
 
 inline Reply<int, bool> Follower::onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
+
+    if(!isValidTransaction()) {
+        return std::make_tuple(_master->_currentTerm, false);
+    }
+
     ++(*_watchdog);
 
     // TODO
@@ -881,6 +941,11 @@ inline Reply<int, bool> Follower::onReceiveAppendEntryRPC(int term, int leaderId
 }
 
 inline Reply<int, bool> Follower::onReceiveRequestVoteRPC(int term, int candidateId) {
+
+    if(!isValidTransaction()) {
+        return std::make_tuple(_master->_currentTerm, false);
+    }
+
     ++(*_watchdog);
 
     // reject stale request
@@ -902,10 +967,14 @@ inline Candidate::Candidate(Raft *master)
 
 inline void Candidate::onBecome(std::shared_ptr<Raft::State> previous) {
     _master->performElection();
-    // TODO block onReceiveAppendEntryRPC and onReceiveRequestVoteRPC
 }
 
 inline Reply<int, bool> Candidate::onReceiveAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
+
+    if(!isValidTransaction()) {
+        return std::make_tuple(_master->_currentTerm, false);
+    }
+
     // @paper
     //
     // While waiting for votes, a candidate may receive an
@@ -916,12 +985,8 @@ inline Reply<int, bool> Candidate::onReceiveAppendEntryRPC(int term, int leaderI
     // state.
 
     if(term >= _master->_currentTerm) {
-        // FIXME. not 100% safe
-        // TODO
-        // If we post a become-operation,
-        // we should abort other ways to post become-operations
-        _master->_transitioner.post([this] {
-            _master->becomeFollower();
+        _master->_transitioner.post([master = this->_master] {
+            master->becomeFollower();
         });
         return std::make_tuple(_master->_currentTerm, true);
     }
@@ -934,6 +999,11 @@ inline Reply<int, bool> Candidate::onReceiveAppendEntryRPC(int term, int leaderI
 }
 
 inline Reply<int, bool> Candidate::onReceiveRequestVoteRPC(int term, int candidateId) {
+
+    if(!isValidTransaction()) {
+        return std::make_tuple(_master->_currentTerm, false);
+    }
+
     // TODO
     return std::make_tuple(_master->_currentTerm, false);
 }
