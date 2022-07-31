@@ -2,13 +2,27 @@
 #include "co.hpp"
 
 void testInitialElection2A() {
+
+	auto &env = co::open();
+
+	if(!co::test()) {
+		std::cerr << "not a coroutine" << std::endl;
+		return;
+	}
+
     int servers = 3;
 	std::vector<trpc::Endpoint> peers {
 		{"127.0.0.1", 2335},
 		{"127.0.0.1", 2336},
 		{"127.0.0.1", 2337}
 	};
+	std::vector<std::shared_ptr<cxxraft::Raft>> rafts;
     auto config = cxxraft::Config::make(peers);
+
+	for(size_t i = 0; i < peers.size(); ++i) {
+		auto raft = cxxraft::Raft::make(*config, i);
+		raft->start();
+	}
 
     config->begin();
 
@@ -20,6 +34,8 @@ void testInitialElection2A() {
     auto term1 = config->checkTerms();
 
     if(term1 < 1) {
+		std::cerr << "term1 < 1" << std::endl;
+		std::cerr << "term1 == " << term1 << std::endl;
     }
 
     co::poll(nullptr, 0, std::chrono::duration<useconds_t, std::milli>
@@ -29,14 +45,25 @@ void testInitialElection2A() {
 
     if(term1 != term2) {
         // warning
+		std::cerr << "term1 != term2" << std::endl;
     }
 
     config->checkOneLeader();
 
     config->end();
+
+	co::loop();
 }
 
 void testReElection2A() {
+
+	auto &env = co::open();
+
+	if(!co::test()) {
+		std::cerr << "not a coroutine" << std::endl;
+		return;
+	}
+
     int servers = 3;
 	std::vector<trpc::Endpoint> peers {
 		{"127.0.0.1", 2335},
@@ -44,6 +71,11 @@ void testReElection2A() {
 		{"127.0.0.1", 2337}
 	};
     auto config = cxxraft::Config::make(peers);
+
+	for(size_t i = 0; i < peers.size(); ++i) {
+		auto raft = cxxraft::Raft::make(*config, i);
+		raft->start();
+	}
 
     config->begin();
 
@@ -80,6 +112,14 @@ void testReElection2A() {
 }
 
 void testManyElections2A() {
+
+	auto &env = co::open();
+
+	if(!co::test()) {
+		std::cerr << "not a coroutine" << std::endl;
+		return;
+	}
+
 	int servers = 7;
 	std::vector<trpc::Endpoint> peers;
 	for(auto i {0}; i < servers; ++i) {
@@ -87,6 +127,11 @@ void testManyElections2A() {
 	}
 
 	auto config = cxxraft::Config::make(peers);
+
+	for(size_t i = 0; i < peers.size(); ++i) {
+		auto raft = cxxraft::Raft::make(*config, i);
+		raft->start();
+	}
 
     config->begin();
 
@@ -117,5 +162,10 @@ void testManyElections2A() {
 }
 
 int main() {
+	cxxraft::Log::init();
+	auto &env = co::open();
+	env.createCoroutine(testInitialElection2A)
+		->resume();
+	co::loop();
 
 }
