@@ -8,10 +8,8 @@ namespace cxxraft {
 struct Peer {
     trpc::Endpoint endpoint;
     std::optional<trpc::Client> client;
-    std::optional<trpc::Client> heartbeat;
 
-    Worker proactive;
-    Worker timing;
+    Worker executor;
 
     Peer(trpc::Endpoint endpoint): endpoint(endpoint) {}
 };

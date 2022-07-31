@@ -117,7 +117,7 @@ private:
     // return: voted
     std::shared_ptr<int> prepareElection();
 
-    void sendHeartBeat();
+    void maintainAuthority();
 
     size_t getTransaction();
 
@@ -170,10 +170,6 @@ public:
     //
     // Raft ensures that there is at most one leader in a given term.
     //
-    // In some situations an election will result in a split vote.
-    // In this case the term will end with no leader;
-    // a new term (with a new election) will begin shortly.
-    //
     // The leader handles all client requests (if
     // a client contacts a follower the follower redirects it to the leader)
     constexpr static Bitmask FLAGS_LEADER     = 1ULL << 1;
@@ -211,6 +207,9 @@ private:
     // Log or configuration
     Storage _storage;
 
+    // latest term server has seen (initialized to 0
+    // on first boot, increases monotonically)
+    //
     // @paper
     //
     // Each server stores a current term number,
@@ -492,6 +491,8 @@ inline Reply<int, bool> Raft::requestVoteRPC(int term, int candidateId /*...*/) 
 template <typename NextState>
 inline void Raft::become() {
     auto previous = std::move(_fsm);
+    // abort all the old transactions / pending coroutine jobs requested by `previous`
+    // (or `previous` of `previous`...)
     _transaction++;
     _fsm = std::make_shared<NextState>(this);
     _fsm->onBecome(std::move(previous));
@@ -525,6 +526,12 @@ inline void Raft::performElection() {
         ToMicro{Raft::RAFT_ELECTION_TIMEOUT_MAX}.count()
     );
 
+
+    // @paper
+    //
+    // In some situations an election will result in a split vote.
+    // In this case the term will end with no leader;
+    // a new term (with a new election) will begin shortly.
     while(isValidTransaction(transaction)) {
         auto voting = prepareElection();
         // if failed, wait for a while
@@ -581,12 +588,13 @@ inline void Raft::performKeepAlive(std::shared_ptr<size_t> watchdog) {
 inline void Raft::performHeartBeat() {
     const auto transaction = getTransaction();
     CXXRAFT_LOG_DEBUG("perform heart beat, node id:", _id);
+    // This routine will be aborted
+    // when RPC coroutines receive a return state operation
     while(isValidTransaction(transaction)) {
-        sendHeartBeat();
+        maintainAuthority();
         co::usleep(std::chrono::duration<useconds_t, std::micro>(
             RAFT_HEARTBEAT_INTERVAL).count());
     }
-    // TODO become...
 }
 
 inline size_t Raft::majority() {
@@ -613,7 +621,7 @@ inline std::shared_ptr<int> Raft::prepareElection() {
     // 1: vote for itself
     auto voted = std::make_shared<int>(1);
 
-    auto gatherVote = [this, currentTerm = _currentTerm, voted, transaction](int index) {
+    auto gatherVote = [this, voted, transaction](int index) {
 
         if(!isValidTransaction(transaction)) {
             return;
@@ -622,7 +630,7 @@ inline std::shared_ptr<int> Raft::prepareElection() {
         auto &peer = _peers[index];
 
         // clean up pending jobs
-        peer.proactive.strike();
+        peer.executor.strike();
 
         // abort or optimize
         if(auto v = *voted; v == -1 || v >= majority()) {
@@ -647,7 +655,7 @@ inline std::shared_ptr<int> Raft::prepareElection() {
             return;
         }
 
-        auto reply = peer.client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, currentTerm, _id);
+        auto reply = peer.client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id);
 
         if(!isValidTransaction(transaction)) {
             return;
@@ -664,26 +672,14 @@ inline std::shared_ptr<int> Raft::prepareElection() {
             return;
         }
 
-        // @paper
-        //
-        // While waiting for votes, a candidate may receive an
-        // AppendEntries RPC from another server claiming to be
-        // leader.
-        // If the leader’s term (included in its RPC) is at least
-        // as large as the candidate’s current term, then the candidate
-        // recognizes the leader as legitimate and returns to follower
-        // state.
-        // If the term in the RPC is smaller than the candidate’s
-        // current term, then the candidate rejects the RPC and continues in candidate state.
-
         auto [term, voteGranted] = reply->cast();
-
 
         if(!voteGranted) {
             CXXRAFT_LOG_DEBUG("vote rejected");
             return;
         }
-        // `_currentTerm`, not `currentTerm`
+
+        // TODO
         if(term < _currentTerm) {
             return;
         }
@@ -701,23 +697,23 @@ inline std::shared_ptr<int> Raft::prepareElection() {
 
     // don't use for-each &&
     for(size_t i = 0; i < _peers.size(); ++i) {
-        _peers[i].proactive.post([=] {gatherVote(i);});
+        _peers[i].executor.post([=] {gatherVote(i);});
     }
 
     return voted;
 }
 
-inline void Raft::sendHeartBeat() {
+inline void Raft::maintainAuthority() {
 
     const auto transaction = getTransaction();
 
 
-    auto send = [this, currentTerm = _currentTerm, transaction](int index) {
+    auto sendHeartbeat = [this, transaction](int index) {
 
         if(!isValidTransaction(transaction)) return;
 
         auto &peer = _peers[index];
-        peer.proactive.strike();
+        peer.executor.strike();
 
         // See prepareElection()
         bool reconnect = !peer.client || (peer.client && peer.client->fd() < 0);
@@ -738,7 +734,7 @@ inline void Raft::sendHeartBeat() {
     };
 
     for(size_t i = 0; i < _peers.size(); ++i) {
-        _peers[i].proactive.post([=] { send(i); });
+        _peers[i].executor.post([=] { sendHeartbeat(i); });
     }
 }
 
@@ -747,6 +743,8 @@ inline size_t Raft::getTransaction() {
 }
 
 inline bool Raft::isValidTransaction(size_t transaction) {
+    // a very simple method
+    // because we use coroutines
     return _transaction == transaction;
 }
 
@@ -879,6 +877,8 @@ inline Reply<int, bool> Leader::onReceiveAppendEntryRPC(int term, int leaderId, 
 
     // World has changed
     if(term > _master->_currentTerm) {
+        // update currentTerm, see "Rules for Servers"
+        _master->_currentTerm = term;
         _master->_transitioner.post([master = this->_master] {
             master->becomeFollower();
         });
@@ -902,7 +902,9 @@ inline Reply<int, bool> Leader::onReceiveRequestVoteRPC(int term, int candidateI
 
     // check stale leader
     if(term > _master->_currentTerm) {
-        _master->_transitioner.post([master = this->_master] {
+        // update currentTerm, see "Rules for Servers"
+        _master->_currentTerm = term;
+        _master->_transitioner.post([master = _master] {
             master->becomeFollower();
         });
     }
@@ -935,7 +937,11 @@ inline Reply<int, bool> Follower::onReceiveAppendEntryRPC(int term, int leaderId
 
     ++(*_watchdog);
 
-    // TODO
+
+    if(term > _master->_currentTerm) {
+        _master->_currentTerm = term;
+    }
+
 
     return std::make_tuple(_master->_currentTerm, false);
 }
@@ -952,6 +958,9 @@ inline Reply<int, bool> Follower::onReceiveRequestVoteRPC(int term, int candidat
     if(term < _master->_currentTerm) {
         return std::make_tuple(_master->_currentTerm, false);
     }
+
+    // update currentTerm, see "Rules for Servers"
+    _master->_currentTerm = term;
 
     bool voteGranted = false;
     if(!_master->_voteFor || *_master->_voteFor == candidateId) {
@@ -985,6 +994,10 @@ inline Reply<int, bool> Candidate::onReceiveAppendEntryRPC(int term, int leaderI
     // state.
 
     if(term >= _master->_currentTerm) {
+        // update latest(largest) term candidate has seen
+        // but paper said the result of AppendEntries RPC is "for **leader** to update itself" only?
+        _master->_currentTerm = term;
+
         _master->_transitioner.post([master = this->_master] {
             master->becomeFollower();
         });
@@ -1002,6 +1015,10 @@ inline Reply<int, bool> Candidate::onReceiveRequestVoteRPC(int term, int candida
 
     if(!isValidTransaction()) {
         return std::make_tuple(_master->_currentTerm, false);
+    }
+
+    if(term > _master->_currentTerm) {
+        _master->_currentTerm = term;
     }
 
     // TODO
