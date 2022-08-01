@@ -160,13 +160,9 @@ void testManyElections2A() {
 }
 
 int main() {
-	cxxraft::Log::init();
+	dlog::Log::init();
 	auto &env = co::open();
-	env.createCoroutine([] {
-		testInitialElection2A();
-		// testReElection2A();
-		// testManyElections2A();
-	})
+	env.createCoroutine(testInitialElection2A)
 		->resume();
 	co::loop();
 
