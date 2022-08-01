@@ -51,8 +51,6 @@ void testInitialElection2A() {
     config->checkOneLeader();
 
     config->end();
-
-	co::loop();
 }
 
 void testReElection2A() {
@@ -66,9 +64,9 @@ void testReElection2A() {
 
     int servers = 3;
 	std::vector<trpc::Endpoint> peers {
-		{"127.0.0.1", 2335},
-		{"127.0.0.1", 2336},
-		{"127.0.0.1", 2337}
+		{"127.0.0.1", 2338},
+		{"127.0.0.1", 2339},
+		{"127.0.0.1", 2340}
 	};
     auto config = cxxraft::Config::make(peers);
 
@@ -164,7 +162,11 @@ void testManyElections2A() {
 int main() {
 	cxxraft::Log::init();
 	auto &env = co::open();
-	env.createCoroutine(testInitialElection2A)
+	env.createCoroutine([] {
+		testInitialElection2A();
+		// testReElection2A();
+		// testManyElections2A();
+	})
 		->resume();
 	co::loop();
 

@@ -101,6 +101,11 @@ private:
 
     void becomeCandidate();
 
+    // A wrapper of transactional post
+    // used to safely queue `f` to `fsm` coroutine
+    template <typename F>
+    void statePost(F f);
+
 // perform can be called by state machine only
 // all perform functions should be executed endless
 private:
@@ -123,6 +128,8 @@ private:
     std::shared_ptr<int> prepareElection();
 
     void maintainAuthority();
+
+    void updateTransaction();
 
     size_t getTransaction();
 
@@ -162,6 +169,11 @@ public:
     // (less than RAFT_ELECTION_TIMEOUT_MIN)
     constexpr static auto RAFT_HEARTBEAT_INTERVAL
         { std::chrono::milliseconds(100) };
+
+    // When post a request to FSM but not apply
+    // RPCs are still running and may reply to peers
+    // given a junk term less than 0 will be omitted by peers
+    constexpr static int JUNK_TERM = -1;
 
     using Bitmask = uint64_t;
 
@@ -247,7 +259,9 @@ private:
     // When invokes become...(), _transaction will add one
     // and pending coroutines will know themselves are outdated and then abort
     //
-    // _transaction will be checked in every context switch
+    // In breif, it looks like pthread_cancel()
+    // _transaction will be checked in every context switch as a cancellation point
+    // Cancellation of outdated state machine either happens immediately or when it reaches a cancellation point
     //
     // _transaction and _currentTerm are not strictly related
     size_t _transaction;
@@ -503,7 +517,7 @@ inline void Raft::become() {
     auto previous = std::move(_fsm);
     // abort all the old transactions / pending coroutine jobs requested by `previous`
     // (or `previous` of `previous`...)
-    _transaction++;
+    updateTransaction();
     _fsm = std::make_shared<NextState>(this);
     _fsm->onBecome(std::move(previous));
 }
@@ -521,6 +535,12 @@ inline void Raft::becomeFollower() {
 inline void Raft::becomeCandidate() {
     CXXRAFT_LOG_DEBUG(simpleInfo(), "become candidate");
     become<Candidate>();
+}
+
+template <typename F>
+inline void Raft::statePost(F f) {
+    updateTransaction();
+    _transitioner.post(std::move(f));
 }
 
 inline void Raft::performElection() {
@@ -561,7 +581,7 @@ inline void Raft::performElection() {
     CXXRAFT_LOG_DEBUG(simpleInfo(), "post: candidate -> leader");
 
     // See performKeepAlive
-    _transitioner.post([this] {
+    statePost([this] {
         becomeLeader();
     });
 }
@@ -587,7 +607,7 @@ inline void Raft::performKeepAlive(std::shared_ptr<size_t> watchdog) {
 
     CXXRAFT_LOG_DEBUG(simpleInfo(), "post: follower -> candidate");
     // waiting RPC for a long time
-    _transitioner.post([this] {
+    statePost([this] {
         // We cannot call this function without post()
         // Because state transitions are implicit recursive
         // They will raise stackoverflow
@@ -690,13 +710,20 @@ inline std::shared_ptr<int> Raft::prepareElection() {
             return;
         }
 
-        // TODO
         if(term < _currentTerm) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "old term vote:", term);
             return;
         }
 
-        (*voted)++;
+        // Question. not a same term? reset vote?
+        // if(term > _currentTerm) {
+        //     CXXRAFT_LOG_DEBUG(simpleInfo(), "update to latest term:", term);
+        //     _currentTerm = term;
+        // }
+
+        if(term == _currentTerm) {
+            (*voted)++;
+        }
 
         CXXRAFT_LOG_DEBUG(simpleInfo(), "current voted:", *voted);
 
@@ -705,8 +732,6 @@ inline std::shared_ptr<int> Raft::prepareElection() {
         // A candidate wins an election if it receives votes from
         // a majority of the servers in the full cluster for the same
         // term.
-
-        // Question. what about term > _currentTerm ?
     };
 
     // don't use for-each &&
@@ -745,12 +770,31 @@ inline void Raft::maintainAuthority() {
         if(!reply) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "no reply in client");
         }
+
+        auto [term, _] = reply->cast();
+
+        if(term > _currentTerm) {
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "update to latest term:", term);
+            // TODO update term in `_transitioner`
+            _currentTerm = term;
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "but leader receives a newer term, return to follower");
+            statePost([this] {
+                becomeFollower();
+            });
+        }
     };
 
     for(size_t i = 0; i < _peers.size(); ++i) {
         _peers[i].executor.post([=] { sendHeartbeat(i); });
     }
 }
+
+inline void Raft::updateTransaction() {
+    // currently it is a simple operation
+    // further transaction may be a complex obejct
+    _transaction++;
+}
+
 
 inline size_t Raft::getTransaction() {
     return _transaction;
@@ -893,7 +937,7 @@ inline Reply<int, bool> Leader::onReceiveAppendEntryRPC(int term, int leaderId, 
     // currently peers don't care about the reply
 
     if(!isValidTransaction()) {
-        return std::make_tuple(_master->_currentTerm, false);
+        return std::make_tuple(Raft::JUNK_TERM, false);
     }
 
     // World has changed
@@ -906,7 +950,7 @@ inline Reply<int, bool> Leader::onReceiveAppendEntryRPC(int term, int leaderId, 
         _master->_currentTerm = term;
 
         CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "post: leader -> follower");
-        _master->_transitioner.post([master = this->_master] {
+        _master->statePost([master = this->_master] {
             master->becomeFollower();
         });
         return std::make_tuple(_master->_currentTerm, true);
@@ -921,7 +965,7 @@ inline Reply<int, bool> Leader::onReceiveRequestVoteRPC(int term, int candidateI
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "receive requestVoteRPC:", term, candidateId);
 
     if(!isValidTransaction()) {
-        return std::make_tuple(_master->_currentTerm, false);
+        return std::make_tuple(Raft::JUNK_TERM, false);
     }
 
     // reject stale request
@@ -933,9 +977,15 @@ inline Reply<int, bool> Leader::onReceiveRequestVoteRPC(int term, int candidateI
     // check stale leader
     if(term > _master->_currentTerm) {
         // update currentTerm, see "Rules for Servers"
+        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "update to latest term:", term);
         _master->_currentTerm = term;
+
+        // TODO update voteFor elsewhere
+        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "new term, reset voteFor");
+        _master->_voteFor = std::nullopt;
+
         CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "post: leader -> follower");
-        _master->_transitioner.post([master = _master] {
+        _master->statePost([master = _master] {
             master->becomeFollower();
         });
     }
@@ -966,7 +1016,7 @@ inline Reply<int, bool> Follower::onReceiveAppendEntryRPC(int term, int leaderId
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "receive appendEntryRPC: ", term, leaderId, prevLogIndex, prevLogTerm);
 
     if(!isValidTransaction()) {
-        return std::make_tuple(_master->_currentTerm, false);
+        return std::make_tuple(Raft::JUNK_TERM, false);
     }
 
     ++(*_watchdog);
@@ -986,7 +1036,7 @@ inline Reply<int, bool> Follower::onReceiveRequestVoteRPC(int term, int candidat
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "receive requestVoteRPC:", term, candidateId);
 
     if(!isValidTransaction()) {
-        return std::make_tuple(_master->_currentTerm, false);
+        return std::make_tuple(Raft::JUNK_TERM, false);
     }
 
     ++(*_watchdog);
@@ -1025,7 +1075,7 @@ inline Reply<int, bool> Candidate::onReceiveAppendEntryRPC(int term, int leaderI
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "receive appendEntryRPC: ", term, leaderId, prevLogIndex, prevLogTerm);
 
     if(!isValidTransaction()) {
-        return std::make_tuple(_master->_currentTerm, false);
+        return std::make_tuple(Raft::JUNK_TERM, false);
     }
 
     // @paper
@@ -1047,7 +1097,7 @@ inline Reply<int, bool> Candidate::onReceiveAppendEntryRPC(int term, int leaderI
         }
 
         CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "post: candidate -> follower");
-        _master->_transitioner.post([master = this->_master] {
+        _master->statePost([master = this->_master] {
             master->becomeFollower();
         });
         return std::make_tuple(_master->_currentTerm, true);
@@ -1062,13 +1112,18 @@ inline Reply<int, bool> Candidate::onReceiveAppendEntryRPC(int term, int leaderI
 
 inline Reply<int, bool> Candidate::onReceiveRequestVoteRPC(int term, int candidateId) {
 
+    // Question.
+    // candidates have voted to themselves
+    // but an incoming new term will reset voteFor
+
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "receive requestVoteRPC:", term, candidateId);
 
     if(!isValidTransaction()) {
-        return std::make_tuple(_master->_currentTerm, false);
+        return std::make_tuple(Raft::JUNK_TERM, false);
     }
 
     // reject stale request
+    // TODO junk?
     if(term < _master->_currentTerm) {
         CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "reject stale request, term:", term);
         return std::make_tuple(_master->_currentTerm, false);
@@ -1078,6 +1133,12 @@ inline Reply<int, bool> Candidate::onReceiveRequestVoteRPC(int term, int candida
     if(term > _master->_currentTerm) {
         CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "update to latest term:", term);
         _master->_currentTerm = term;
+        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "reset vote");
+        _master->_voteFor = std::nullopt;
+        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "post: candidate -> master");
+        _master->statePost([master = this->_master] {
+            master->becomeFollower();
+        });
     }
 
     bool voteGranted = false;
