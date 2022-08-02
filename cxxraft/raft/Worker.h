@@ -65,7 +65,7 @@ public:
                     _jobs.pop();
                     nextJob();
                 }
-                // _worker = nullptr;
+                _worker = nullptr;
             });
             _worker->resume();
         }
