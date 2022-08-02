@@ -141,10 +141,16 @@ void testManyElections2A() {
 
     int iters = 10;
     for(auto ii = 1; ii < iters; ++ii) {
+
+        co::usleep(50 * 1000);
+
         // disconnect three nodes
         auto i1 = ::rand() % servers;
         auto i2 = ::rand() % servers;
         auto i3 = ::rand() % servers;
+        while(i1 == i2) i2 = ::rand() % servers;
+        while(i1 == i3 || i2 == i3) i3 = ::rand() %servers;
+
         config->disconnect(i1);
         config->disconnect(i2);
         config->disconnect(i3);
@@ -168,7 +174,7 @@ void testManyElections2A() {
 int main() {
     dlog::Log::init();
     auto &env = co::open();
-    env.createCoroutine(testInitialElection2A)
+    env.createCoroutine(testManyElections2A)
         ->resume();
     co::loop();
 

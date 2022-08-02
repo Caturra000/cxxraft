@@ -161,13 +161,13 @@ public:
     //
     // MIT-6.824 recommends that 1 second is better
     constexpr static auto RAFT_ELECTION_TIMEOUT
-        { std::chrono::milliseconds(300) };
+        { std::chrono::milliseconds(800) };
 
     constexpr static auto RAFT_ELECTION_TIMEOUT_MIN
-        { std::chrono::milliseconds(150) };
+        { std::chrono::milliseconds(400) };
 
     constexpr static auto RAFT_ELECTION_TIMEOUT_MAX
-        { std::chrono::milliseconds(300) };
+        { std::chrono::milliseconds(800) };
 
     // Same as etcd-raft heartbeat interval
     // (less than RAFT_ELECTION_TIMEOUT_MIN)
@@ -269,6 +269,13 @@ private:
     //
     // _transaction and _currentTerm are not strictly related
     size_t _transaction;
+
+// virtual network
+// for config test
+private:
+
+    bool callDisabled() { return _callDisabled; }
+    bool _callDisabled {false};
 
 private:
 
@@ -805,21 +812,9 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
         }
 
 
-        // Try to connect to a raft node
-        // (Although it is a long connection, it may crash before)
-        //
-        // It may be unavailable and make() / connect() spends a lot of time
-        // But we can run this `gatherVote` on many client coroutines
-        // While `gatherVotesFromClients` runs on fsm coroutine
-        bool reconnect = !peer.votes || (peer.votes && peer.votes->fd() < 0);
+        auto client = trpc::Client::make(peer.endpoint);
 
-        if(reconnect) {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "try to connect to a raft node");
-        }
-
-        // what happened?
-        if(reconnect && !(peer.votes = trpc::Client::make(peer.endpoint))) {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "try to connect but failed");
+        if(!client) {
             return;
         }
 
@@ -830,7 +825,9 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
 
         CXXRAFT_LOG_DEBUG(simpleInfo(), "call requset vote:", _currentTerm, _id);
 
-        auto reply = peer.votes->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id);
+        if(callDisabled()) return;
+
+        auto reply = client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id);
 
         // cancellation point after client call
         if(!isValidTransaction(transaction)) {
@@ -897,7 +894,9 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
 
     // don't use for-each &&
     for(size_t i = 0; i < _peers.size(); ++i) {
-        _peers[i].votesExecutor.post([=] {gatherVote(i);});
+        auto &env = co::open();
+        env.createCoroutine([=] {gatherVote(i);})
+            ->resume();
     }
 
     return voteInfo;
@@ -913,18 +912,17 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
         auto &peer = _peers[index];
 
-        // See gatherVotesFromClients()
-        bool reconnect = !peer.client || (peer.client && peer.client->fd() < 0);
+        auto client = trpc::Client::make(peer.endpoint);
 
-        if(reconnect && !(peer.client = trpc::Client::make(peer.endpoint))) {
-            return;
-        }
+        if(!client) return;
 
         if(!isValidTransaction(transaction)) return;
 
+        if(callDisabled()) return;
+
         CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id);
 
-        auto reply = peer.client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm,_id, 0, 0);
+        auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm,_id, 0, 0);
 
         if(!isValidTransaction(transaction)) return;
 
@@ -948,7 +946,9 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
     };
 
     for(size_t i = 0; i < _peers.size(); ++i) {
-        _peers[i].executor.post([=] { sendHeartbeat(i); });
+        auto &env = co::open();
+        env.createCoroutine([=] {sendHeartbeat(i);})
+            ->resume();
     }
 }
 
@@ -1023,6 +1023,7 @@ inline void Config::connect(int index) {
     pServer->onRequest(dummy);
     _connected[index] = true;
 
+    raft->_callDisabled = false;
     raft->statePost([index, this] {
         auto raft = _rafts[index];
         Raft::Bitmask flags = raft->_fsm->flags();
@@ -1051,11 +1052,7 @@ inline void Config::disconnect(int index) {
     _connected[index] = false;
     // cancel all jobs
     raft->updateTransaction();
-    auto &peers = raft->_peers;
-    for(auto &peer : peers) {
-        if(peer.client) peer.client->close();
-        if(peer.votes) peer.votes->close();
-    }
+    raft->_callDisabled = true;
 }
 
 inline void Config::abort() {
