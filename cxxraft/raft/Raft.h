@@ -36,9 +36,9 @@ public:
 public:
 
     Raft(const Raft&) = delete;
-    Raft(Raft&&) = default;
+    Raft(Raft&&) = delete;
     Raft& operator=(const Raft&) = delete;
-    Raft& operator=(Raft&&) = default;
+    Raft& operator=(Raft&&) = delete;
     ~Raft() = default;
 
 // public for std::make_shared
@@ -126,9 +126,9 @@ private:
 
     // used in performElection()
     // return: voted
-    std::shared_ptr<std::tuple<int, int>> gatherVotesFromClients();
+    std::shared_ptr<std::tuple<int, int>> gatherVotesFromClients(size_t transaction);
 
-    void maintainAuthorityToClients();
+    void maintainAuthorityToClients(size_t transaction);
 
     void updateTransaction();
 
@@ -678,7 +678,7 @@ inline void Raft::performElection() {
         // the other servers in the cluster.
         _voteFor = _id;
 
-        auto voteInfo = gatherVotesFromClients();
+        auto voteInfo = gatherVotesFromClients(transaction);
 
         // try to gather faster
         for(size_t step = 0; step < 5; ++step) {
@@ -764,21 +764,20 @@ inline void Raft::performHeartBeat() {
     // This routine will be aborted
     // when RPC coroutines receive a return state operation
     while(isValidTransaction(transaction)) {
-        maintainAuthorityToClients();
+        maintainAuthorityToClients(transaction);
         co::usleep(std::chrono::duration<useconds_t, std::micro>(
             RAFT_HEARTBEAT_INTERVAL).count());
     }
+    CXXRAFT_LOG_DEBUG(simpleInfo(), "abort heartbeat: invalid transcation");
 }
 
 inline size_t Raft::majority() {
     return (1 + _peers.size()) / 2 + 1;
 }
 
-inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
+inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t transaction) {
 
     CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVotesFromClients");
-
-    const auto transaction = getTransaction();
 
     // info: [voted, rejected]
     // (voted == -1) means aborted
@@ -797,10 +796,6 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
         }
 
         auto &peer = _peers[index];
-
-        // clean up pending jobs
-        // TODO remove
-        // peer.votesExecutor.strike();
 
         // abort or optimize
         if(auto [voted, rejected] = *voteInfo;
@@ -821,7 +816,7 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
         if(reconnect) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "try to connect to a raft node");
         }
-    
+
         // what happened?
         if(reconnect && !(peer.votes = trpc::Client::make(peer.endpoint))) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "try to connect but failed");
@@ -833,7 +828,7 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
             return;
         }
 
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "call requset vote.", _currentTerm, _id);
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "call requset vote:", _currentTerm, _id);
 
         auto reply = peer.votes->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id);
 
@@ -844,8 +839,8 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
 
         // check again after network IO
         if(auto [voted, rejected] = *voteInfo;
-            voted == VOTE_ABORTED || voted >= majority() || rejected >= majority()) {
-                CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote return. info:", voted, rejected);
+                voted == VOTE_ABORTED || voted >= majority() || rejected >= majority()) {
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote return. info:", voted, rejected);
             return;
         }
 
@@ -855,7 +850,7 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
         }
 
         auto [term, voteGranted] = reply->cast();
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "vote reply:", term, voteGranted);
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. vote reply:", term, voteGranted);
 
         // FIXME. or peer == candidate && term == currentTerm?
         if(term > _currentTerm) {
@@ -879,12 +874,12 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
 
         if(!voteGranted) {
             rejected++;
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "vote rejected");
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. vote rejected+1,", rejected);
             return;
         }
 
         if(term < _currentTerm) {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "old term vote:", term);
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. old term vote:", term);
             return;
         }
 
@@ -897,10 +892,8 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
             voted++;
         }
 
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "current voteInfo:", voted, rejected);
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. current voteInfo:", voted, rejected);
     };
-
-    CXXRAFT_LOG_DEBUG(simpleInfo(), "peers size:", _peers.size());
 
     // don't use for-each &&
     for(size_t i = 0; i < _peers.size(); ++i) {
@@ -910,17 +903,15 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients() {
     return voteInfo;
 }
 
-inline void Raft::maintainAuthorityToClients() {
-
-    const auto transaction = getTransaction();
-
+inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
     auto sendHeartbeat = [this, transaction](int index) {
+
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthorityToClients");
 
         if(!isValidTransaction(transaction)) return;
 
         auto &peer = _peers[index];
-        // peer.executor.strike();
 
         // See gatherVotesFromClients()
         bool reconnect = !peer.client || (peer.client && peer.client->fd() < 0);
@@ -930,6 +921,8 @@ inline void Raft::maintainAuthorityToClients() {
         }
 
         if(!isValidTransaction(transaction)) return;
+
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id);
 
         auto reply = peer.client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm,_id, 0, 0);
 
@@ -983,7 +976,7 @@ inline bool Raft::vote(int candidateId) {
         _voteFor = candidateId;
         voteGranted = true;
     } else {
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "vote rejected. voted to:", *_voteFor);
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "reject this vote. voted to:", *_voteFor);
     }
     return voteGranted;
 }
@@ -1030,10 +1023,11 @@ inline void Config::connect(int index) {
     pServer->onRequest(dummy);
     _connected[index] = true;
 
-    raft->statePost([&raft] {
+    raft->statePost([index, this] {
+        auto raft = _rafts[index];
         Raft::Bitmask flags = raft->_fsm->flags();
         if(flags & Raft::FLAGS_LEADER) {
-            raft->becomeFollower();
+            raft->becomeLeader();
         } else if(flags & Raft::FLAGS_FOLLOWER) {
             raft->becomeFollower();
         } else {
@@ -1057,6 +1051,11 @@ inline void Config::disconnect(int index) {
     _connected[index] = false;
     // cancel all jobs
     raft->updateTransaction();
+    auto &peers = raft->_peers;
+    for(auto &peer : peers) {
+        if(peer.client) peer.client->close();
+        if(peer.votes) peer.votes->close();
+    }
 }
 
 inline void Config::abort() {
