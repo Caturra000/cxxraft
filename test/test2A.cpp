@@ -51,6 +51,8 @@ void testInitialElection2A() {
     config->checkOneLeader();
 
     config->end();
+
+    ::exit(0);
 }
 
 void testReElection2A() {
@@ -107,6 +109,8 @@ void testReElection2A() {
     config->checkOneLeader();
 
     config->end();
+
+    ::exit(0);
 }
 
 void testManyElections2A() {
@@ -157,12 +161,14 @@ void testManyElections2A() {
     config->checkOneLeader();
 
     config->end();
+
+    ::exit(0);
 }
 
 int main() {
     dlog::Log::init();
     auto &env = co::open();
-    env.createCoroutine(testReElection2A)
+    env.createCoroutine(testInitialElection2A)
         ->resume();
     co::loop();
 
