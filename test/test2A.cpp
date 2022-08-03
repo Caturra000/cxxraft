@@ -1,3 +1,5 @@
+#include <unistd.h>
+#include <sys/wait.h>
 #include "raft/Raft.h"
 #include "co.hpp"
 
@@ -24,7 +26,7 @@ void testInitialElection2A() {
         raft->start();
     }
 
-    config->begin();
+    config->begin("Test (2A): initial election");
 
     config->checkOneLeader();
 
@@ -77,7 +79,7 @@ void testReElection2A() {
         raft->start();
     }
 
-    config->begin();
+    config->begin("Test (2A): election after network failure");
 
     auto leader1 = config->checkOneLeader();
 
@@ -135,7 +137,7 @@ void testManyElections2A() {
         raft->start();
     }
 
-    config->begin();
+    config->begin("Test (2A): multiple elections");
 
     config->checkOneLeader();
 
@@ -172,10 +174,57 @@ void testManyElections2A() {
 }
 
 int main() {
-    dlog::Log::init();
-    auto &env = co::open();
-    env.createCoroutine(testManyElections2A)
-        ->resume();
-    co::loop();
 
+    using TestFunction = void(*)();
+
+    TestFunction test[] = {
+        testInitialElection2A,
+        testReElection2A,
+        testManyElections2A
+    };
+
+    constexpr size_t TESTCASES = sizeof(test) / sizeof(TestFunction);
+
+    auto runTest = [](TestFunction func) {
+        dlog::Log::init();
+        auto &env = co::open();
+        env.createCoroutine(func)->resume();
+        co::loop();
+    };
+
+    // [testcase][success, failed]
+    std::vector<std::tuple<int, int>> results(TESTCASES);
+
+    auto done = [&results](int testcase, int ret) {
+        auto &[success, failed] = results[testcase];
+        if(ret) {
+            failed++;
+            std::cerr << "====FAILED====" << std::endl;
+        }
+        else success++;
+    };
+
+    for(int testcase = 0; testcase < TESTCASES; ++testcase) {
+        for(int round = 0; round < 10; round++) {
+            if(int pid, ret; pid = ::fork()) {
+                ::waitpid(pid, &ret, 0);
+                done(testcase, ret);
+            } else {
+                std::cout << "case: " << testcase << ", "
+                          << "round: " << round << std::endl;
+                runTest(test[testcase]);
+            }
+        }
+    }
+
+    // report
+    for(int testcase = 0; testcase < TESTCASES; ++testcase) {
+        auto [success, failed] = results[testcase];
+        std::cout << "====TEST CASE " << testcase << "====" << std::endl
+                  << "Done:    " << success + failed << std::endl
+                  << "Success: " << success << std::endl
+                  << "Failed:  " << failed << std::endl;
+    }
+
+    return 0;
 }

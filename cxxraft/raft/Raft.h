@@ -10,7 +10,6 @@
 #include "dlog.hpp"
 #include "raft/Reply.h"
 #include "raft/Storage.h"
-#include "raft/Peer.h"
 #include "raft/Worker.h"
 #include "raft/Debugger.h"
 namespace cxxraft {
@@ -220,7 +219,7 @@ private:
     std::optional<trpc::Server> _rpcServer;
 
     // raft peers, NOT include this one
-    std::vector<Peer> _peers;
+    std::vector<trpc::Endpoint> _peers;
 
     // node id for RPC message
     int _id;
@@ -491,7 +490,7 @@ struct Config {
     // Check that everyone agrees on the term.
     int checkTerms();
 
-    void begin() { std::cout << "begin" << std::endl; }
+    void begin(const char *test) { std::cout << "begin: " << test << std::endl; }
     void end() { std::cout << "done" << std::endl;}
 
 
@@ -812,7 +811,7 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
         }
 
 
-        auto client = trpc::Client::make(peer.endpoint);
+        auto client = trpc::Client::make(peer);
 
         if(!client) {
             return;
@@ -912,7 +911,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
         auto &peer = _peers[index];
 
-        auto client = trpc::Client::make(peer.endpoint);
+        auto client = trpc::Client::make(peer);
 
         if(!client) return;
 
