@@ -1,0 +1,16 @@
+简单的raft C++实现
+
+还没完工，极慢速更新中
+目前实现了选举和心跳，已过2A测试
+
+具体实现已经集成了我自己写的其它轮子，作为基础组件：
+* [json库](https://github.com/Caturra000/vsJSON)
+* [日志库](https://github.com/Caturra000/dLog)
+* [协程库](https://github.com/Caturra000/co)
+* [RPC库](https://github.com/Caturra000/tRPC)
+
+只能运行在Linux x86-64环境，且编译要求gcc全家桶，C++17以上标准
+
+要打log的话需要添加编译选项`-DCXXRAFT_FLAG_DLOG_ENABLE`
+
+头文件目录默认`-Icxxraft`
