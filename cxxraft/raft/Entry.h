@@ -1,6 +1,8 @@
 #pragma once
+#include "raft/Message.h"
 namespace cxxraft {
 
-class Entry {};
+// [index, term, commited]
+using Entry = Message<int, int, bool>;
 
 } // cxxraft
