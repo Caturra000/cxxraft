@@ -87,11 +87,14 @@ private:
     // also used as heartbeat (§5.2).
     // return: [term, success]
     // TODO static member function
-    Reply<int, bool> appendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm /*, null log*/);
+    Reply<int, bool> appendEntryRPC(int term, int leaderId,
+                                    int prevLogIndex, int prevLogTerm,
+                                    Log::EntriesArray entries, int leaderCommit);
 
     // Invoked by candidates to gather votes (§5.2).
     // return: [term, voteGranted]
-    Reply<int, bool> requestVoteRPC(int term, int candidateId /*...*/);
+    Reply<int, bool> requestVoteRPC(int term, int candidateId,
+                                    int lastLogIndex, int lastLogTerm);
 
     // TODO junk
     // static bool defaultResponseProxy(trpc::Server::ProtocolType &response);
@@ -373,10 +376,13 @@ public:
     virtual void onBecome(std::shared_ptr<Raft::State> previous) = 0;
 
     // runs on a RPC server coroutine
-    virtual Reply<int, bool> onAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) = 0;
+    virtual Reply<int, bool> onAppendEntryRPC(int term, int leaderId,
+                                              int prevLogIndex, int prevLogTerm,
+                                              Log::EntriesArray entries, int leaderCommit) = 0;
 
     // runs on a RPC server coroutine
-    virtual Reply<int, bool> onRequestVoteRPC(int term, int candidateId) = 0;
+    virtual Reply<int, bool> onRequestVoteRPC(int term, int candidateId,
+                                              int lastLogIndex, int lastLogTerm) = 0;
 
     // @paper
     //
@@ -406,8 +412,11 @@ struct Leader: public Raft::State {
 
     void onBecome(std::shared_ptr<Raft::State> previous) override;
 
-    Reply<int, bool> onAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
-    Reply<int, bool> onRequestVoteRPC(int term, int candidateId) override;
+    Reply<int, bool> onAppendEntryRPC(int term, int leaderId,
+                                      int prevLogIndex, int prevLogTerm,
+                                      Log::EntriesArray entries, int leaderCommit) override;
+    Reply<int, bool> onRequestVoteRPC(int term, int candidateId,
+                                      int lastLogIndex, int lastLogTerm) override;
 
 };
 
@@ -422,9 +431,12 @@ struct Follower: public Raft::State {
     void onBecome(std::shared_ptr<Raft::State> previous) override;
 
     // running on a RPC coroutine (0)
-    Reply<int, bool> onAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
+    Reply<int, bool> onAppendEntryRPC(int term, int leaderId,
+                                      int prevLogIndex, int prevLogTerm,
+                                      Log::EntriesArray entries, int leaderCommit) override;
 
-    Reply<int, bool> onRequestVoteRPC(int term, int candidateId) override;
+    Reply<int, bool> onRequestVoteRPC(int term, int candidateId,
+                                      int lastLogIndex, int lastLogTerm) override;
 
     bool updateLatestTerm(int term) override;
 
@@ -441,9 +453,12 @@ struct Candidate: public Raft::State {
 
     void onBecome(std::shared_ptr<Raft::State> previous) override;
 
-    Reply<int, bool> onAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) override;
+    Reply<int, bool> onAppendEntryRPC(int term, int leaderId,
+                                      int prevLogIndex, int prevLogTerm,
+                                      Log::EntriesArray entries, int leaderCommit) override;
 
-    Reply<int, bool> onRequestVoteRPC(int term, int candidateId) override;
+    Reply<int, bool> onRequestVoteRPC(int term, int candidateId,
+                                      int lastLogIndex, int lastLogTerm) override;
 };
 
 
@@ -613,13 +628,19 @@ inline void Raft::start() {
     // NOTE: `this` pointer will be moved in move semantic
     // you should construct raft object by make()
 
-    _rpcServer->bind(RAFT_APPEND_ENTRY_RPC, [this](int term, int leaderId, int prevLogIndex, int prevLogTerm) {
-        return this->appendEntryRPC(term, leaderId, prevLogIndex, prevLogTerm);
-    });
+    auto appendEntry = [this](int term, int leaderId,
+                              int prevLogIndex, int prevLogTerm,
+                              Log::EntriesArray entries, int leaderCommit) {
+        return this->appendEntryRPC(term, leaderId, prevLogIndex, prevLogTerm, std::move(entries), leaderCommit);
+    };
 
-    _rpcServer->bind(RAFT_REQUEST_VOTE_RPC, [this](int term, int candidateId) {
-        return this->requestVoteRPC(term, candidateId);
-    });
+    auto requestVote = [this](int term, int candidateId,
+                              int lastLogIndex, int lastLogTerm) {
+        return this->requestVoteRPC(term, candidateId, lastLogIndex, lastLogTerm);
+    };
+
+    _rpcServer->bind(RAFT_APPEND_ENTRY_RPC, appendEntry);
+    _rpcServer->bind(RAFT_REQUEST_VOTE_RPC, requestVote);
 
     // TODO
     // add unreliable network
@@ -661,12 +682,14 @@ inline auto Raft::startCommand(Command command) -> std::tuple<int, int, bool> {
     return {1, 2, false};
 }
 
-inline Reply<int, bool> Raft::appendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
-    return _fsm->onAppendEntryRPC(term, leaderId, prevLogIndex, prevLogTerm);
+inline Reply<int, bool> Raft::appendEntryRPC(int term, int leaderId,
+                                             int prevLogIndex, int prevLogTerm,
+                                             Log::EntriesArray entries, int leaderCommit) {
+    return _fsm->onAppendEntryRPC(term, leaderId, prevLogIndex, prevLogTerm, std::move(entries), leaderCommit);
 }
 
-inline Reply<int, bool> Raft::requestVoteRPC(int term, int candidateId /*...*/) {
-    return _fsm->onRequestVoteRPC(term, candidateId);
+inline Reply<int, bool> Raft::requestVoteRPC(int term, int candidateId, int lastLogIndex, int lastLogTerm) {
+    return _fsm->onRequestVoteRPC(term, candidateId, lastLogIndex, lastLogTerm);
 }
 
 template <typename NextState>
@@ -883,7 +906,7 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
         // for config test
         if(callDisabled()) return;
 
-        auto reply = client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id);
+        auto reply = client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id, 0, 0);
 
         // cancellation point after client call
         if(!isValidTransaction(transaction)) {
@@ -979,7 +1002,8 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
         CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id);
 
         // TODO prevLogIndex...
-        auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id, 0, 0);
+        Log::EntriesSlice slice = _log.fork(Log::ByReference{});
+        auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id, 0, 0, slice, 0);
 
         if(!isValidTransaction(transaction)) return;
 
@@ -1329,7 +1353,9 @@ inline void Leader::onBecome(std::shared_ptr<Raft::State> previous) {
     _master->performHeartBeat();
 }
 
-inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
+inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId,
+                                                 int prevLogIndex, int prevLogTerm,
+                                                 Log::EntriesArray entries, int leaderCommit) {
 
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC: ", term, leaderId, prevLogIndex, prevLogTerm);
 
@@ -1355,7 +1381,8 @@ inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId, int pre
     return std::make_tuple(_master->_currentTerm, false);
 }
 
-inline Reply<int, bool> Leader::onRequestVoteRPC(int term, int candidateId) {
+inline Reply<int, bool> Leader::onRequestVoteRPC(int term, int candidateId,
+                                                 int lastLogIndex, int lastLogTerm) {
 
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onRequestVoteRPC:", term, candidateId);
 
@@ -1407,7 +1434,9 @@ inline void Follower::onBecome(std::shared_ptr<Raft::State> previous) {
     _master->performKeepAlive(_watchdog);
 }
 
-inline Reply<int, bool> Follower::onAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
+inline Reply<int, bool> Follower::onAppendEntryRPC(int term, int leaderId,
+                                                   int prevLogIndex, int prevLogTerm,
+                                                   Log::EntriesArray entries, int leaderCommit) {
 
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC: ", term, leaderId, prevLogIndex, prevLogTerm);
 
@@ -1427,7 +1456,8 @@ inline Reply<int, bool> Follower::onAppendEntryRPC(int term, int leaderId, int p
     return std::make_tuple(_master->_currentTerm, false);
 }
 
-inline Reply<int, bool> Follower::onRequestVoteRPC(int term, int candidateId) {
+inline Reply<int, bool> Follower::onRequestVoteRPC(int term, int candidateId,
+                                                   int lastLogIndex, int lastLogTerm) {
 
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onRequestVoteRPC:", term, candidateId);
 
@@ -1487,7 +1517,9 @@ inline void Candidate::onBecome(std::shared_ptr<Raft::State> previous) {
     _master->performElection();
 }
 
-inline Reply<int, bool> Candidate::onAppendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
+inline Reply<int, bool> Candidate::onAppendEntryRPC(int term, int leaderId,
+                                                    int prevLogIndex, int prevLogTerm,
+                                                    Log::EntriesArray entries, int leaderCommit) {
 
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC:", term, leaderId, prevLogIndex, prevLogTerm);
 
@@ -1534,7 +1566,8 @@ inline Reply<int, bool> Candidate::onAppendEntryRPC(int term, int leaderId, int 
     return std::make_tuple(_master->_currentTerm, false);
 }
 
-inline Reply<int, bool> Candidate::onRequestVoteRPC(int term, int candidateId) {
+inline Reply<int, bool> Candidate::onRequestVoteRPC(int term, int candidateId,
+                                                    int lastLogIndex, int lastLogTerm) {
 
     // Question.
     // candidates have voted to themselves
