@@ -12,6 +12,8 @@
 #include "raft/Storage.h"
 #include "raft/Worker.h"
 #include "raft/Debugger.h"
+#include "raft/Command.h"
+#include "raft/Log.h"
 namespace cxxraft {
 
 struct Config;
@@ -30,7 +32,23 @@ public:
     // return: [term, isLeader] <std::tuple<int, bool>>
     //
     // (Note: not state machine `raft::state`)
-    auto getState();
+    auto getState() -> std::tuple<int, bool>;
+
+    // the service using Raft (e.g. a k/v server) wants to start
+    // agreement on the next command to be appended to Raft's log. if this
+    // server isn't the leader, returns false. otherwise start the
+    // agreement and return immediately. there is no guarantee that this
+    // command will ever be committed to the Raft log, since the leader
+    // may fail or lose an election. even if the Raft instance has been killed,
+    // this function should return gracefully.
+    //
+    // the first return value is the index that the command will appear at
+    // if it's ever committed. the second return value is the current
+    // term. the third return value is true if this server believes it is
+    // the leader.
+    //
+    // return: [index of command, term, isLeader]
+    auto startCommand(Command command) -> std::tuple<int, int, bool>;
 
 public:
 
@@ -68,11 +86,15 @@ private:
     // Invoked by leader to replicate log entries (§5.3);
     // also used as heartbeat (§5.2).
     // return: [term, success]
+    // TODO static member function
     Reply<int, bool> appendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm /*, null log*/);
 
     // Invoked by candidates to gather votes (§5.2).
     // return: [term, voteGranted]
     Reply<int, bool> requestVoteRPC(int term, int candidateId /*...*/);
+
+    // TODO junk
+    // static bool defaultResponseProxy(trpc::Server::ProtocolType &response);
 
 private:
 
@@ -176,6 +198,7 @@ public:
     // When post a request to FSM but not apply
     // RPCs are still running and may reply to peers
     // given a junk term less than 0 will be omitted by peers
+    // TODO rpc.onResponse (defaultResponseProxy)
     constexpr static int JUNK_TERM = -1;
 
     using Bitmask = uint64_t;
@@ -244,13 +267,13 @@ private:
 
     std::optional<int> _voteFor;
 
-    // TODO log
+    Log _log;
 
     // TODO
-    // int _commitIndex {};
+    int _commitIndex {};
 
     // // TODO
-    // int _lastApplied {};
+    int _lastApplied {};
 
     // Finite State Machine
     std::shared_ptr<State> _fsm;
@@ -490,6 +513,27 @@ struct Config {
     // Check that everyone agrees on the term.
     int checkTerms();
 
+//////////// for 2B
+
+    // how many servers think a log entry is committed?
+    // [count, command]
+    // TODO
+    auto nCommitted(int index) -> std::tuple<int, Command>;
+
+    // do a complete agreement.
+    // it might choose the wrong leader initially,
+    // and have to re-submit after giving up.
+    // entirely gives up after about 10 seconds.
+    // indirectly checks that the servers agree on the
+    // same value, since nCommitted() checks this,
+    // as do the threads that read from applyCh.
+    // returns index.
+    // if retry==true, may submit the command multiple
+    // times, in case a leader fails just after Start().
+    // if retry==false, calls Start() only once, in order
+    // to simplify the early Lab 2B tests.
+    int one(Command command, int expectedServers, bool retry);
+
     void begin(const char *test) { std::cout << "begin: " << test << std::endl; }
     void end() { std::cout << "done" << std::endl;}
 
@@ -602,8 +646,19 @@ inline std::shared_ptr<Raft> Raft::make(Config &config, int id) {
     return raft;
 }
 
-inline auto Raft::getState() {
+inline auto Raft::getState() -> std::tuple<int, bool> {
     return std::make_tuple(_currentTerm, bool(_fsm->type() == FLAGS_LEADER));
+}
+
+inline auto Raft::startCommand(Command command) -> std::tuple<int, int, bool> {
+
+    auto [term, isLeader] = getState();
+
+    if(!isLeader) return {0, term, false};
+
+    // _logs.append(..., std::move(command));
+
+    return {1, 2, false};
 }
 
 inline Reply<int, bool> Raft::appendEntryRPC(int term, int leaderId, int prevLogIndex, int prevLogTerm) {
@@ -684,9 +739,10 @@ inline void Raft::performElection() {
         // the other servers in the cluster.
         _voteFor = _id;
 
+        // Create asynchronous client coroutines to gather votes
         auto voteInfo = gatherVotesFromClients(transaction);
 
-        // try to gather faster
+        // Try to poll faster
         for(size_t step = 0; step < 5; ++step) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "co::sleep down");
             co::usleep(dist(engine) / 5);
@@ -824,6 +880,7 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
 
         CXXRAFT_LOG_DEBUG(simpleInfo(), "call requset vote:", _currentTerm, _id);
 
+        // for config test
         if(callDisabled()) return;
 
         auto reply = client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id);
@@ -848,7 +905,6 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
         auto [term, voteGranted] = reply->cast();
         CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. vote reply:", term, voteGranted);
 
-        // FIXME. or peer == candidate && term == currentTerm?
         if(term > _currentTerm) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "update to latest term:", term);
             _currentTerm = term;
@@ -917,11 +973,13 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
         if(!isValidTransaction(transaction)) return;
 
+        // for config test
         if(callDisabled()) return;
 
         CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id);
 
-        auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm,_id, 0, 0);
+        // TODO prevLogIndex...
+        auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id, 0, 0);
 
         if(!isValidTransaction(transaction)) return;
 
@@ -965,6 +1023,7 @@ inline size_t Raft::getTransaction() {
 inline bool Raft::isValidTransaction(size_t transaction) {
     // a very simple method
     // because we use coroutines
+    // TODO atomic in multithreads
     return _transaction == transaction;
 }
 
@@ -1137,7 +1196,75 @@ inline int Config::checkTerms() {
     return term;
 }
 
+inline auto Config::nCommitted(int index) -> std::tuple<int, Command> {
+    int count = 0;
+    Command cmd;
+    for(int i = 0; i < _rafts.size(); ++i) {
+        std::optional<Log::Entry> pEntry
+            { _rafts[i]->_log.get(index, Log::Optional{}) };
+        if(pEntry) {
+            auto &[_, cmd1] = *pEntry;
+            if(count > 0 && !equal(cmd1, cmd)) {
+                CXXRAFT_LOG_WTF("committed values do not match: index",
+                    index);
+                abort();
+            }
+            count++;
+            cmd = cmd1;
+        }
+    }
+    return {count, cmd};
+}
 
+inline int Config::one(Command command, int expectedServers, bool retry) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::system_clock::now;
+    auto t0 = now();
+    int starts = 0;
+    while(now() - t0 < 10s) {
+        // try all the servers, maybe one is the leader.
+        int index = -1;
+        for(size_t si = 0, n = _peers.size(); si < n; ++si) {
+            starts = (starts + 1) % n;
+            cxxraft::Raft *raft {};
+            if(_connected[starts]) {
+                raft = _rafts[starts].get();
+            }
+            if(raft) {
+                auto [index1, _, ok] = raft->startCommand(command);
+                if(ok) {
+                    index = index1;
+                    break;
+                }
+            }
+        }
+
+        if(index != -1) {
+            // somebody claimed to be the leader and to have
+            // submitted our command; wait a while for agreement.
+            auto t1 = now();
+            while(now() - t1 < 2s) {
+                auto [nd, cmd1] = nCommitted(index);
+                if(nd > 0 && nd >= expectedServers) {
+                    // commited
+                    if(equal(cmd1,command)) {
+                        // and it was the command we submitted.
+                        return index;
+                    }
+                }
+                co::usleep(20 * 1000);
+            }
+            if(!retry) {
+                CXXRAFT_LOG_WTF("one", command, "failed to reach agreement");
+                abort();
+            }
+        } else {
+            co::usleep(50 * 1000);
+        }
+        CXXRAFT_LOG_WTF("one", command, "failed to reach agreement");
+        return -1;
+    }
+}
 
 
 
