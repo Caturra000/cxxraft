@@ -14,6 +14,7 @@
 #include "raft/Debugger.h"
 #include "raft/Command.h"
 #include "raft/Log.h"
+#include "raft/Peer.h"
 namespace cxxraft {
 
 struct Config;
@@ -245,7 +246,8 @@ private:
     std::optional<trpc::Server> _rpcServer;
 
     // raft peers, NOT include this one
-    std::vector<trpc::Endpoint> _peers;
+    // std::vector<trpc::Endpoint> _peers;
+    std::map<int, Peer> _peers;
 
     // node id for RPC message
     int _id;
@@ -272,10 +274,10 @@ private:
 
     Log _log;
 
-    // TODO
+    // index of highest log entry known to be committed
     int _commitIndex {};
 
-    // // TODO
+    // index of highest log entry applied to state machine
     int _lastApplied {};
 
     // Finite State Machine
@@ -390,7 +392,7 @@ public:
     // If RPC request or response contains term T > currentTerm:
     // set currentTerm = T, convert to follower (§5.1)
     // return: convert to follower
-    virtual bool updateLatestTerm(int term);
+    virtual bool followUp(int term);
 
 protected:
 
@@ -438,7 +440,7 @@ struct Follower: public Raft::State {
     Reply<int, bool> onRequestVoteRPC(int term, int candidateId,
                                       int lastLogIndex, int lastLogTerm) override;
 
-    bool updateLatestTerm(int term) override;
+    bool followUp(int term) override;
 
 private:
     std::shared_ptr<size_t> _watchdog;
@@ -608,7 +610,9 @@ inline Raft::Raft(Config &config, int id)
       _transaction(0)
 {
     for(size_t i = 0; i < config._peers.size(); i++) {
-        if(i != id) _peers.emplace_back(config._peers[i]);
+        if(i != id) {
+            _peers.try_emplace(i, i, config._peers[i]);
+        }
     }
 
 }
@@ -677,9 +681,13 @@ inline auto Raft::startCommand(Command command) -> std::tuple<int, int, bool> {
 
     if(!isLeader) return {0, term, false};
 
-    // _logs.append(..., std::move(command));
+    int index = _log.size();
 
-    return {1, 2, false};
+    // [index, term]
+    Log::Metadata metadata = std::make_tuple(index, term);
+    _log.append(metadata, std::move(command));
+
+    return {index, term, true};
 }
 
 inline Reply<int, bool> Raft::appendEntryRPC(int term, int leaderId,
@@ -871,16 +879,16 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
 
     constexpr static int VOTE_ABORTED = -1;
 
-    auto gatherVote = [this, voteInfo, transaction](int index) {
+    auto gatherVote = [this, voteInfo, transaction](int id) {
 
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote, index:", index);
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote, id:", id);
 
         if(!isValidTransaction(transaction)) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "invalid transaction");
             return;
         }
 
-        auto &peer = _peers[index];
+        auto &peer = _peers[id];
 
         // abort or optimize
         if(auto [voted, rejected] = *voteInfo;
@@ -889,8 +897,7 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
             return;
         }
 
-
-        auto client = trpc::Client::make(peer);
+        auto client = trpc::Client::make(peer.endpoint);
 
         if(!client) {
             return;
@@ -904,9 +911,16 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
         CXXRAFT_LOG_DEBUG(simpleInfo(), "call requset vote:", _currentTerm, _id);
 
         // for config test
-        if(callDisabled()) return;
+        if(callDisabled()) {
+            return;
+        }
 
-        auto reply = client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id, 0, 0);
+        // TODO snapshot
+        auto &entry = _log.back();
+        auto &metadata = std::get<0>(entry);
+        auto [lastLogIndex, lastLogTerm] = metadata.cast();
+        auto reply = client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id,
+                        lastLogIndex, lastLogTerm);
 
         // cancellation point after client call
         if(!isValidTransaction(transaction)) {
@@ -928,16 +942,7 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
         auto [term, voteGranted] = reply->cast();
         CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. vote reply:", term, voteGranted);
 
-        if(term > _currentTerm) {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "update to latest term:", term);
-            _currentTerm = term;
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "reset voteFor");
-            _voteFor = std::nullopt;
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "post: candidate -> follower.",
-                "Reason: discovers new term");
-            statePost([this] {
-                becomeFollower();
-            });
+        if(_fsm->followUp(term)) {
             return;
         }
 
@@ -971,9 +976,10 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
     };
 
     // don't use for-each &&
-    for(size_t i = 0; i < _peers.size(); ++i) {
+    for(auto &&kv : _peers) {
         auto &env = co::open();
-        env.createCoroutine([=] {gatherVote(i);})
+        auto id = kv.first;
+        env.createCoroutine([=] {gatherVote(id);})
             ->resume();
     }
 
@@ -982,15 +988,15 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
 
 inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
-    auto sendHeartbeat = [this, transaction](int index) {
+    auto sendHeartbeat = [this, transaction](int id) {
 
         CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthorityToClients");
 
         if(!isValidTransaction(transaction)) return;
 
-        auto &peer = _peers[index];
+        auto &peer = _peers[id];
 
-        auto client = trpc::Client::make(peer);
+        auto client = trpc::Client::make(peer.endpoint);
 
         if(!client) return;
 
@@ -1001,9 +1007,15 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
         CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id);
 
-        // TODO prevLogIndex...
-        Log::EntriesSlice slice = _log.fork(Log::ByReference{});
-        auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id, 0, 0, slice, 0);
+        // TODO generateAppendEntriesArguments()
+        int nextIndex = peer.nextIndex;
+        int prevLogIndex = nextIndex - 1;
+        auto &entry = _log.back();
+        auto &metadata = std::get<0>(entry);
+        int prevLogTerm = std::get<1>(metadata);
+        Log::EntriesSlice slice = _log.fork(nextIndex, nextIndex + 1, Log::ByReference{});
+        auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id,
+            prevLogIndex, prevLogTerm, slice, _commitIndex);
 
         if(!isValidTransaction(transaction)) return;
 
@@ -1011,24 +1023,25 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "no reply in client");
         }
 
-        auto [term, _] = reply->cast();
+        auto [term, success] = reply->cast();
 
-        if(term > _currentTerm) {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "update to latest term:", term);
-            _currentTerm = term;
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "reset voteFor");
-            _voteFor = std::nullopt;
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "post: leader -> follower",
-                "Reason: discovers server with higher term");
-            statePost([this] {
-                becomeFollower();
-            });
+        if(_fsm->followUp(term)) {
+            return;
+        }
+
+        // 1. Reply false if term < currentTerm (§5.1)
+        // 2. Reply false if log doesn’t contain an entry at prevLogIndex
+        //    whose term matches prevLogTerm (§5.3)
+        if(!success /*&& term >= _currentTerm*/) {
+            // follower(receiver) can be outdated
+            // TODO update index
         }
     };
 
-    for(size_t i = 0; i < _peers.size(); ++i) {
+    for(auto &&kv : _peers) {
         auto &env = co::open();
-        env.createCoroutine([=] {sendHeartbeat(i);})
+        auto id = kv.first;
+        env.createCoroutine([=] {sendHeartbeat(id);})
             ->resume();
     }
 }
@@ -1307,7 +1320,7 @@ inline int Config::one(Command command, int expectedServers, bool retry) {
 
 
 
-inline bool Raft::State::updateLatestTerm(int term) {
+inline bool Raft::State::followUp(int term) {
     if(term > _master->_currentTerm) {
         CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "update to latest term:", term);
         _master->_currentTerm = term;
@@ -1350,6 +1363,13 @@ inline Leader::Leader(Raft *master)
 }
 
 inline void Leader::onBecome(std::shared_ptr<Raft::State> previous) {
+    // TODO log index init
+    for(auto &&[id, peer] : _master->_peers) {
+        // initialized to leader last log index + 1
+        peer.matchIndex = _master->_log.size();
+        // initialized to 0, increases monotonically
+        peer.nextIndex = 0;
+    }
     _master->performHeartBeat();
 }
 
@@ -1369,11 +1389,11 @@ inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId,
         return std::make_tuple(_master->_currentTerm, false);
     }
 
-    bool changed = updateLatestTerm(term);
+    bool changed = followUp(term);
 
     // World has changed
     if(changed) {
-        return std::make_tuple(_master->_currentTerm, false);
+        return std::make_tuple(_master->_currentTerm, true);
     }
 
     CXXRAFT_LOG_WTF(_master->simpleInfo(), "I am the only leader in this term, you too?");
@@ -1397,7 +1417,7 @@ inline Reply<int, bool> Leader::onRequestVoteRPC(int term, int candidateId,
     }
 
     // check stale leader
-    updateLatestTerm(term);
+    followUp(term);
 
     bool voteGranted = _master->vote(candidateId);
 
@@ -1450,10 +1470,12 @@ inline Reply<int, bool> Follower::onAppendEntryRPC(int term, int leaderId,
 
     ++(*_watchdog);
 
-    updateLatestTerm(term);
+    followUp(term);
 
 
-    return std::make_tuple(_master->_currentTerm, false);
+    // TODO log
+
+    return std::make_tuple(_master->_currentTerm, true);
 }
 
 inline Reply<int, bool> Follower::onRequestVoteRPC(int term, int candidateId,
@@ -1474,13 +1496,13 @@ inline Reply<int, bool> Follower::onRequestVoteRPC(int term, int candidateId,
 
     ++(*_watchdog);
 
-    updateLatestTerm(term);
+    followUp(term);
 
     bool voteGranted = _master->vote(candidateId);
     return std::make_tuple(_master->_currentTerm, voteGranted);
 }
 
-inline bool Follower::updateLatestTerm(int term) {
+inline bool Follower::followUp(int term) {
     if(term > _master->_currentTerm) {
         CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "update to latest term:", term);
         _master->_currentTerm = term;
@@ -1585,7 +1607,7 @@ inline Reply<int, bool> Candidate::onRequestVoteRPC(int term, int candidateId,
         return std::make_tuple(_master->_currentTerm, false);
     }
 
-    updateLatestTerm(term);
+    followUp(term);
 
     bool voteGranted = _master->vote(candidateId);
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onRequestVoteRPC result:", voteGranted);

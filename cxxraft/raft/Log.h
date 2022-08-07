@@ -8,13 +8,29 @@
 namespace cxxraft {
 
 // In memory log
-// Figure 6
+// Logs are composed of entries, which are numbered
+// sequentially. Each entry contains the term in which it was
+// created (the number in each box) and a command for the state
+// machine. An entry is considered committed if it is safe for that
+// entry to be applied to state machines.
 class Log {
 
 public:
 
-    // [index, term, commited]
-    using Metadata = Message<int, int, bool>;
+    // [index, term]
+    //
+    // @index
+    // identifies its position in the log
+    //
+    // @term
+    // used to detect inconsistencies between logs
+    // and to ensure some of the properties in Figure 3
+    //
+    // <del>@commited</del>
+    // <del>whether it is safe for that entry to be applied
+    // to state machines</del>
+    //
+    using Metadata = Message<int, int>;
 
     // raft metadata + user command
     using Entry = std::tuple<Metadata, Command>;
@@ -45,9 +61,16 @@ public:
     void append(Entry entry);
     void append(Metadata, Command);
 
+    int size() { return _entries.size(); }
+
+    Entry& back();
+
     // TODO overwrite
     // assign and truncate
     // void overwrite();
+
+    // TODO apply
+    // bool apply(int index);
 
     EntriesArray fork();
     EntriesSlice fork(ByReference);
@@ -66,7 +89,6 @@ private:
     // EntriesArray _entries;
 
     std::vector<Entry> _entries;
-    size_t _commited {};
 };
 
 class Log::EntriesArray: public std::vector<Log::Entry> {
@@ -140,6 +162,10 @@ inline void Log::append(Metadata metadata, Command command) {
     append(std::make_tuple(metadata, std::move(command)));
 }
 
+inline Log::Entry& Log::back() {
+    return _entries.back();
+}
+
 inline Log::EntriesArray Log::fork() {
     return this->fork(0, _entries.size());
 }
@@ -167,7 +193,7 @@ inline Log::Log() {
     Command placeholder = {
         {"jojo", "dio"}
     };
-    Metadata metadata = std::make_tuple(0, -1, true);
+    Metadata metadata = std::make_tuple(0, -1);
     append(metadata, std::move(placeholder));
 }
 
