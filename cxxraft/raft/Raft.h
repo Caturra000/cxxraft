@@ -912,8 +912,8 @@ inline auto Raft::gatherVotesFromClients(size_t transaction) -> std::shared_ptr<
         }
 
         // TODO snapshot
-        auto &entry = _log.back();
-        auto &metadata = std::get<0>(entry);
+        const auto &entry = _log.back();
+        const auto &metadata = std::get<0>(entry);
         auto [lastLogIndex, lastLogTerm] = metadata.cast();
         auto reply = client->call<RequestVoteReply>(RAFT_REQUEST_VOTE_RPC, _currentTerm, _id,
                         lastLogIndex, lastLogTerm);
@@ -1006,8 +1006,8 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
         // TODO generateAppendEntriesArguments()
         int nextIndex = peer.nextIndex;
         int prevLogIndex = nextIndex - 1;
-        auto &entry = _log.back();
-        auto &metadata = std::get<0>(entry);
+        const auto &entry = _log.back();
+        const auto &metadata = std::get<0>(entry);
         int prevLogTerm = std::get<1>(metadata);
         Log::EntriesSlice slice = _log.fork(nextIndex, nextIndex + 1, Log::ByReference{});
         auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id,

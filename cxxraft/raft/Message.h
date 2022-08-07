@@ -45,7 +45,7 @@ public:
     // example: auto [x, y, z] = message.cast();
     // (I don't know why it can't be deducted automatically...)
     Base&       cast()       & { return *this; }
-    const Base& cast() const & { return const_cast<const Base&>(*this); }
+    const Base& cast() const & { return static_cast<const Base&>(*this); }
     Base&&      cast()      && { return static_cast<Base&&>(*this); }
 
 // what you don't care about

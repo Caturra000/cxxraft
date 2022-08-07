@@ -63,7 +63,8 @@ public:
 
     int size() { return _entries.size(); }
 
-    Entry& back();
+    const Entry& back() const;
+    Entry& back(ByReference);
 
     // TODO overwrite
     // assign and truncate
@@ -162,7 +163,11 @@ inline void Log::append(Metadata metadata, Command command) {
     append(std::make_tuple(metadata, std::move(command)));
 }
 
-inline Log::Entry& Log::back() {
+inline const Log::Entry& Log::back() const {
+    return _entries.back();
+}
+
+inline Log::Entry& Log::back(Log::ByReference) {
     return _entries.back();
 }
 
