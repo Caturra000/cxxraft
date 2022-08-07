@@ -150,8 +150,8 @@ private:
     size_t majority();
 
     // used in performElection()
-    // return: voted
-    std::shared_ptr<std::tuple<int, int>> gatherVotesFromClients(size_t transaction);
+    // return: [voted, rejected, aborted]
+    auto gatherVotesFromClients(size_t transaction) -> std::shared_ptr<std::tuple<int, int, bool>>;
 
     void maintainAuthorityToClients(size_t transaction);
 
@@ -774,25 +774,27 @@ inline void Raft::performElection() {
         auto voteInfo = gatherVotesFromClients(transaction);
 
         // Try to poll faster
-        for(size_t step = 0; step < 5; ++step) {
+        constexpr static size_t NOP_COUNT = 5;
+        for(size_t nop = NOP_COUNT; nop--;) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "co::sleep down");
-            co::usleep(dist(engine) / 5);
+            co::usleep(dist(engine) / NOP_COUNT);
             CXXRAFT_LOG_DEBUG(simpleInfo(), "co::sleep up");
             if(!isValidTransaction(transaction)) {
                 CXXRAFT_LOG_DEBUG(simpleInfo(), "invalid transaction");
                 return;
             }
-            auto [voted, rejected] = *voteInfo;
+            auto [voted, rejected, _] = *voteInfo;
             // confirmed
             if(voted >= majority() || rejected >= majority()) {
                 break;
             }
         }
 
-        auto &[voted, rejected] = *voteInfo;
+        auto &[voted, rejected, aborted] = *voteInfo;
+
+        aborted = true;
 
         CXXRAFT_LOG_DEBUG(simpleInfo(), "gathered:", voted, rejected);
-
 
         if(voted >= majority()) {
             break;
@@ -803,9 +805,6 @@ inline void Raft::performElection() {
         } else {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "rejected, new election");
         }
-
-        // abort this round!
-        voted = VOTE_ABORTED;
     }
 
     if(!isValidTransaction(transaction)) {
@@ -868,16 +867,13 @@ inline size_t Raft::majority() {
     return (1 + _peers.size()) / 2 + 1;
 }
 
-inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t transaction) {
+inline auto Raft::gatherVotesFromClients(size_t transaction) -> std::shared_ptr<std::tuple<int, int, bool>> {
 
     CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVotesFromClients");
 
-    // info: [voted, rejected]
-    // (voted == -1) means aborted
+    // info: [voted, rejected, aborted]
     // 1: vote for itself
-    auto voteInfo = std::make_shared<std::tuple<int, int>>(1, 0);
-
-    constexpr static int VOTE_ABORTED = -1;
+    auto voteInfo = std::make_shared<std::tuple<int, int, bool>>(1, 0, false);
 
     auto gatherVote = [this, voteInfo, transaction](int id) {
 
@@ -891,8 +887,8 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
         auto &peer = _peers[id];
 
         // abort or optimize
-        if(auto [voted, rejected] = *voteInfo;
-            voted == VOTE_ABORTED || voted >= majority() || rejected >= majority()) {
+        if(auto [voted, rejected, aborted] = *voteInfo;
+            aborted || voted >= majority() || rejected >= majority()) {
                 CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote return. info:", voted, rejected);
             return;
         }
@@ -928,8 +924,8 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
         }
 
         // check again after network IO
-        if(auto [voted, rejected] = *voteInfo;
-                voted == VOTE_ABORTED || voted >= majority() || rejected >= majority()) {
+        if(auto [voted, rejected, aborted] = *voteInfo;
+                aborted || voted >= majority() || rejected >= majority()) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote return. info:", voted, rejected);
             return;
         }
@@ -946,9 +942,9 @@ inline std::shared_ptr<std::tuple<int, int>> Raft::gatherVotesFromClients(size_t
             return;
         }
 
-        auto &[voted, rejected] = *voteInfo;
+        auto &[voted, rejected, aborted] = *voteInfo;
 
-        if(voted == VOTE_ABORTED) {
+        if(aborted) {
             return;
         }
 
@@ -1067,6 +1063,7 @@ inline bool Raft::isValidTransaction(size_t transaction) {
 inline bool Raft::vote(int candidateId) {
     bool voteGranted = false;
     if(!_voteFor || *_voteFor == candidateId) {
+        // TODO match log
         CXXRAFT_LOG_DEBUG(simpleInfo(), "vote granted. vote for:", candidateId);
         _voteFor = candidateId;
         voteGranted = true;
