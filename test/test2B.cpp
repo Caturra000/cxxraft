@@ -1,4 +1,4 @@
-#include "raft/Raft.h"
+#include "cxxraft.hpp"
 #include "co.hpp"
 
 void testBasicAgree2B() {

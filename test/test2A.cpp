@@ -1,6 +1,6 @@
 #include <unistd.h>
 #include <sys/wait.h>
-#include "raft/Raft.h"
+#include "cxxraft.hpp"
 #include "co.hpp"
 
 void testInitialElection2A() {
