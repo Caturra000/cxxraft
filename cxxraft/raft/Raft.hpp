@@ -516,6 +516,8 @@ inline bool Raft::vote(int candidateId, int candidateLastLogIndex, int candidate
         CXXRAFT_LOG_DEBUG(simpleInfo(), "vote granted. vote for:", candidateId);
         _voteFor = candidateId;
         voteGranted = true;
+    } else if(!_voteFor) {
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "reject this vote. outdated");
     } else {
         CXXRAFT_LOG_DEBUG(simpleInfo(), "reject this vote. voted to:", *_voteFor);
     }

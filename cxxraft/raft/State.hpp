@@ -239,8 +239,6 @@ inline Reply<int, bool> Follower::onRequestVoteRPC(int term, int candidateId,
         return std::make_tuple(_master->_currentTerm, false);
     }
 
-    ++(*_watchdog);
-
     followUp(term);
 
     bool voteGranted = _master->vote(candidateId, lastLogIndex, lastLogTerm);
