@@ -83,6 +83,8 @@ inline auto Raft::startCommand(Command command) -> std::tuple<int, int, bool> {
 
     if(!isLeader) return {0, term, false};
 
+    CXXRAFT_LOG_DEBUG(simpleInfo(), "startCommand:", dump(command));
+
     int index = appendEntry(std::move(command));
 
     return {index, term, true};
@@ -373,7 +375,7 @@ inline auto Raft::gatherVotesFromClients(size_t transaction) -> std::shared_ptr<
     for(auto &&kv : _peers) {
         auto &env = co::open();
         auto id = kv.first;
-        env.createCoroutine([=] {gatherVote(id);})
+        env.createCoroutine(gatherVote, id)
             ->resume();
     }
 
@@ -419,6 +421,8 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                 "entries:", dump(slice));
         }
 
+        bool isHeartbeat = slice.size() == 0;
+
         auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id,
             prevLogIndex, prevLogTerm, slice, _commitIndex);
 
@@ -426,6 +430,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
         if(!reply) {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "no reply in client");
+            return;
         }
 
         auto [term, success] = reply->cast();
@@ -435,7 +440,13 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
             return;
         }
 
+        // stale leader
         if(_fsm->followUp(term)) {
+            return;
+        }
+
+        // heartbeat only
+        if(isHeartbeat) {
             return;
         }
 
@@ -446,10 +457,12 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
         // Note. ignore old term commit
         if(success) {
-            peer.matchIndex = std::max(peer.matchIndex, peer.nextIndex);
-            peer.nextIndex = std::min(peer.nextIndex + 1, _log.lastIndex() + 1);
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "before update peer", id, "matchIndex:", peer.matchIndex, "nextIndex:", peer.nextIndex);
+            peer.matchIndex = std::max(peer.matchIndex, prevLogIndex + slice.size());
+            peer.nextIndex = std::min(peer.nextIndex + slice.size(), _log.lastIndex() + 1);
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "update peer", id, "matchIndex:", peer.matchIndex, "nextIndex:", peer.nextIndex);
             // FIXME performance
-            updateCommitIndex();
+            updateCommitIndexForSender();
         } else {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "AppendEntries fails because of log inconsistency. peer id:", id);
             if(peer.nextIndex <= 0) {
@@ -462,7 +475,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
     for(auto &&kv : _peers) {
         auto &env = co::open();
         auto id = kv.first;
-        env.createCoroutine([=] {ping(id);})
+        env.createCoroutine(ping, id)
             ->resume();
     }
 }
@@ -520,7 +533,7 @@ inline int Raft::appendEntry(Command command) {
     return nextIndex;
 }
 
-inline void Raft::updateCommitIndex() {
+inline void Raft::updateCommitIndexForSender() {
     // performed by leader
 
     // a stupid O(n) algorithm
@@ -552,9 +565,20 @@ inline void Raft::updateCommitIndex() {
             // TODO lastApplied
 
             CXXRAFT_LOG_DEBUG(simpleInfo(), "got latest commit index:", N);
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "dump log", dump(_log.fork()));
+            for(auto &&[id, peer] : _peers) {
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "dump peer", id, "match:", peer.matchIndex, "next:", peer.nextIndex);
+            }
             break;
         }
     }
+}
+
+inline std::optional<Log::Entry> Raft::getCommittedCopy(int index) {
+    if(index < 0 || index > _commitIndex) {
+        return std::nullopt;
+    }
+    return _log.get(index, Log::Optional{});
 }
 
 } // cxxraft

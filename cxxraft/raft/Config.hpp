@@ -11,6 +11,7 @@ inline std::shared_ptr<Config> Config::make(std::vector<trpc::Endpoint> peers) {
 }
 
 inline void Config::connect(int index) {
+    if(_connected[index]) return;
     CXXRAFT_LOG_DEBUG("connect server", index, "to virtual network");
     auto raft = _rafts[index];
     CXXRAFT_LOG_DEBUG("server info:", raft->simpleInfo());
@@ -38,6 +39,7 @@ inline void Config::connect(int index) {
 }
 
 inline void Config::disconnect(int index) {
+    if(!_connected[index]) return;
     CXXRAFT_LOG_DEBUG("disconnect server", index, "to virtual network");
     auto raft = _rafts[index];
     CXXRAFT_LOG_DEBUG("server info:", raft->simpleInfo());
@@ -143,7 +145,7 @@ inline auto Config::nCommitted(int index) -> std::tuple<int, Command> {
     Command cmd;
     for(int i = 0; i < _rafts.size(); ++i) {
         std::optional<Log::Entry> pEntry
-            { _rafts[i]->_log.get(index, Log::Optional{}) };
+            { _rafts[i]->getCommittedCopy(index) };
         if(pEntry) {
             auto &[_, cmd1] = *pEntry;
             if(count > 0 && !equal(cmd1, cmd)) {
@@ -197,15 +199,15 @@ inline int Config::one(Command command, int expectedServers, bool retry) {
                 co::usleep(20 * 1000);
             }
             if(!retry) {
-                // FIXME hardcode "op"
-                CXXRAFT_LOG_WTF("one", command["op"].to<int>(), "failed to reach agreement");
+                CXXRAFT_LOG_WTF("one", dump(command), "failed to reach agreement");
                 abort();
             }
         } else {
             co::usleep(50 * 1000);
         }
     }
-    CXXRAFT_LOG_WTF("one", command["op"].to<int>(), "failed to reach agreement");
+    CXXRAFT_LOG_WTF("one", dump(command), "failed to reach agreement");
+    abort();
     return -1;
 }
 

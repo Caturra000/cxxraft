@@ -34,6 +34,11 @@ struct Debugger {
         return json.dump();
     }
 
+    std::string dump(Command command) {
+        vsjson::Json json = command;
+        return json.dump();
+    }
+
 private:
 
     Self* crtp() { return static_cast<Self*>(this); }

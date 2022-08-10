@@ -1,8 +1,9 @@
 #pragma once
+#include "raft/Debugger.h"
 #include "raft/Raft.h"
 namespace cxxraft {
 
-struct Config {
+struct Config: private Debugger<Config> {
 
     Config(std::vector<trpc::Endpoint> peers);
     static std::shared_ptr<Config> make(std::vector<trpc::Endpoint> peers);
@@ -32,7 +33,6 @@ struct Config {
 
     // how many servers think a log entry is committed?
     // [count, command]
-    // TODO
     auto nCommitted(int index) -> std::tuple<int, Command>;
 
     // do a complete agreement.
@@ -48,6 +48,8 @@ struct Config {
     // if retry==false, calls Start() only once, in order
     // to simplify the early Lab 2B tests.
     int one(Command command, int expectedServers, bool retry);
+
+//////////// verbose
 
     void begin(const char *test) { std::cout << "begin: " << test << std::endl; }
     void end() { std::cout << "done" << std::endl;}

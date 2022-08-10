@@ -181,7 +181,9 @@ private:
     // If there exists an N such that N > commitIndex, a majority
     // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
     // set commitIndex = N (§5.3, §5.4).
-    void updateCommitIndex();
+    void updateCommitIndexForSender();
+
+    std::optional<Log::Entry> getCommittedCopy(int index);
 
 public:
 

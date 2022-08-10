@@ -70,10 +70,6 @@ public:
     const Entry& back() const;
     Entry& back(ByReference);
 
-    // TODO overwrite
-    // assign and truncate
-    // void overwrite();
-
     EntriesArray fork();
     EntriesSlice fork(ByReference);
 
@@ -83,7 +79,8 @@ public:
 
     // simple wrapper
     int lastIndex() const;
-    void popBack();
+
+    // [index, lastIndex]
     void truncate(int index);
 
 public:
@@ -180,14 +177,14 @@ inline void Log::append(Metadata metadata, Command command) {
 
 inline int Log::getIndex(const Entry &entry) {
     const auto &metadata = std::get<0>(entry);
-    auto [_, term] = metadata.cast();
-    return term;
+    auto [index, _] = metadata.cast();
+    return index;
 }
 
 inline int Log::getTerm(const Entry &entry) {
     const auto &metadata = std::get<0>(entry);
-    auto [index, _] = metadata.cast();
-    return index;
+    auto [_, term] = metadata.cast();
+    return term;
 }
 
 inline const Log::Entry& Log::back() const {
@@ -230,12 +227,8 @@ inline int Log::lastIndex() const {
     return std::get<0>(metadata);
 }
 
-inline void Log::popBack() {
-    _entries.pop_back();
-}
-
 inline void Log::truncate(int index) {
-    while(index >= lastIndex()) {
+    while(index <= lastIndex()) {
         _entries.pop_back();
     }
 }

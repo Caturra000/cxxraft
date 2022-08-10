@@ -43,11 +43,13 @@ inline bool Raft::State::updateLog(int prevLogIndex, int prevLogTerm, Log::Entri
         pEntry = _master->_log.get(index, Log::ByPointer{});
         if(pEntry && Log::getTerm(*pEntry) != remoteTerm) {
             CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "conflict log, index:", index,
+                "last:", _master->_log.lastIndex(),
                 "local entries:", _master->dump(_master->_log.fork()));
 
             _master->_log.truncate(index);
 
             CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "truncated:", index,
+                "last:", _master->_log.lastIndex(),
                 "local entries:", _master->dump(_master->_log.fork()));
             break;
         }
@@ -58,16 +60,19 @@ inline bool Raft::State::updateLog(int prevLogIndex, int prevLogTerm, Log::Entri
         _master->_log.append(std::move(entry));
     }
 
+    return true;
+}
+
+inline void Raft::State::updateCommitIndexForReceiver(int leaderCommit) {
     // If leaderCommit > commitIndex, set commitIndex =
     // min(leaderCommit, index of last new entry)
     if(leaderCommit > _master->_commitIndex) {
         _master->_commitIndex = std::min(leaderCommit, _master->_log.lastIndex());
+        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "got latest commit index:", _master->_commitIndex);
+        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "dump log", _master->dump(_master->_log.fork()));
         // _lastApplied...
     }
-    return true;
 }
-
-
 
 
 
@@ -129,6 +134,8 @@ inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId,
         // else return what updateLog() returns
         bool ret = entries.empty() ||
             updateLog(prevLogIndex, prevLogTerm, std::move(entries), leaderCommit);
+
+        updateCommitIndexForReceiver(leaderCommit);
         return std::make_tuple(_master->_currentTerm, ret);
     }
 
@@ -210,6 +217,8 @@ inline Reply<int, bool> Follower::onAppendEntryRPC(int term, int leaderId,
 
     bool ret = entries.empty() ||
         updateLog(prevLogIndex, prevLogTerm, std::move(entries), leaderCommit);
+
+    updateCommitIndexForReceiver(leaderCommit);
 
     return std::make_tuple(_master->_currentTerm, ret);
 }
@@ -309,6 +318,8 @@ inline Reply<int, bool> Candidate::onAppendEntryRPC(int term, int leaderId,
 
     bool ret = entries.empty() ||
         updateLog(prevLogIndex, prevLogTerm, std::move(entries), leaderCommit);
+
+    updateCommitIndexForReceiver(leaderCommit);
 
     return std::make_tuple(_master->_currentTerm, ret);
 }
