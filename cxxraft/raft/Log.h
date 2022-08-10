@@ -2,6 +2,7 @@
 #include <vector>
 #include <tuple>
 #include <optional>
+#include <string>
 #include "vsjson.hpp"
 #include "raft/Message.h"
 #include "raft/Command.h"
@@ -63,6 +64,9 @@ public:
 
     int size() { return _entries.size(); }
 
+    static int getIndex(const Entry &entry);
+    static int getTerm(const Entry &entry);
+
     const Entry& back() const;
     Entry& back(ByReference);
 
@@ -70,15 +74,17 @@ public:
     // assign and truncate
     // void overwrite();
 
-    // TODO apply
-    // bool apply(int index);
-
     EntriesArray fork();
     EntriesSlice fork(ByReference);
 
     // [first, last)
     EntriesArray fork(int first, int last);
     EntriesSlice fork(int first, int last, ByReference);
+
+    // simple wrapper
+    int lastIndex() const;
+    void popBack();
+    void truncate(int index);
 
 public:
 
@@ -113,10 +119,13 @@ class Log::EntriesSlice {
 public:
     EntriesSlice(int first, int last, std::vector<Entry> *self)
         : _first(first), _last(last), _entries(self) {}
+    EntriesSlice(): EntriesSlice(0, 0, nullptr) {}
 
     operator vsjson::Json() {
         vsjson::ArrayImpl array;
-        for(int index = _first; index < _last; ++index) {
+        if(!_entries) return array;
+        int last = std::min<int>(_last, _entries->size());
+        for(int index = _first; index < last; ++index) {
             auto &entry = _entries->operator[](index);
             auto &[metadata, command] = entry;
             vsjson::ArrayImpl impl;
@@ -125,6 +134,12 @@ public:
             array.emplace_back(std::move(impl));
         }
         return array;
+    }
+
+    int size() {
+        if(!_entries) return 0;
+        int last = std::min<int>(_last, _entries->size());
+        return last - _first;
     }
 
 private:
@@ -163,6 +178,18 @@ inline void Log::append(Metadata metadata, Command command) {
     append(std::make_tuple(metadata, std::move(command)));
 }
 
+inline int Log::getIndex(const Entry &entry) {
+    const auto &metadata = std::get<0>(entry);
+    auto [_, term] = metadata.cast();
+    return term;
+}
+
+inline int Log::getTerm(const Entry &entry) {
+    const auto &metadata = std::get<0>(entry);
+    auto [index, _] = metadata.cast();
+    return index;
+}
+
 inline const Log::Entry& Log::back() const {
     return _entries.back();
 }
@@ -181,6 +208,10 @@ inline Log::EntriesSlice Log::fork(Log::ByReference) {
 
 inline Log::EntriesArray Log::fork(int first, int last) {
     Log::EntriesArray child;
+    last = std::min<int>(last, _entries.size());
+    if(last - first <= 0) {
+        return child;
+    }
     child.reserve(last - first);
     for(auto index = first; index < last; ++index) {
         child.emplace_back(_entries[index]);
@@ -191,6 +222,22 @@ inline Log::EntriesArray Log::fork(int first, int last) {
 inline Log::EntriesSlice Log::fork(int first, int last, Log::ByReference) {
     Log::EntriesSlice slice(first, last, &_entries);
     return slice;
+}
+
+inline int Log::lastIndex() const {
+    const auto &entry = back();
+    const auto &metadata = std::get<0>(entry);
+    return std::get<0>(metadata);
+}
+
+inline void Log::popBack() {
+    _entries.pop_back();
+}
+
+inline void Log::truncate(int index) {
+    while(index >= lastIndex()) {
+        _entries.pop_back();
+    }
 }
 
 inline Log::Log() {

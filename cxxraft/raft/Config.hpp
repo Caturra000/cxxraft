@@ -197,15 +197,16 @@ inline int Config::one(Command command, int expectedServers, bool retry) {
                 co::usleep(20 * 1000);
             }
             if(!retry) {
-                CXXRAFT_LOG_WTF("one", command, "failed to reach agreement");
+                // FIXME hardcode "op"
+                CXXRAFT_LOG_WTF("one", command["op"].to<int>(), "failed to reach agreement");
                 abort();
             }
         } else {
             co::usleep(50 * 1000);
         }
-        CXXRAFT_LOG_WTF("one", command, "failed to reach agreement");
-        return -1;
     }
+    CXXRAFT_LOG_WTF("one", command["op"].to<int>(), "failed to reach agreement");
+    return -1;
 }
 
 } // cxxraft

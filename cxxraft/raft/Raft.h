@@ -38,7 +38,7 @@ public:
     // the service using Raft (e.g. a k/v server) wants to start
     // agreement on the next command to be appended to Raft's log. if this
     // server isn't the leader, returns false. otherwise start the
-    // agreement and return immediately. there is no guarantee that this
+    // agreement and return **immediately**. there is **no guarantee** that this
     // command will ever be committed to the Raft log, since the leader
     // may fail or lose an election. even if the Raft instance has been killed,
     // this function should return gracefully.
@@ -162,7 +162,26 @@ private:
     bool isValidTransaction(size_t transaction);
 
     // return: voteGranted
-    bool vote(int candidateId);
+    bool vote(int candidateId, int candidateLastLogIndex, int candidateLastLogTerm);
+
+// for log replication
+private:
+
+    void applyEntry(int index);
+
+    int appendEntry(Command command);
+
+    // The second property(If two entries in different logs have the same index
+    // and term, then the logs are identical in all preceding
+    // entries) is guaranteed by a simple consistency check performed by AppendEntries
+    // void consistencyCheck();
+
+    // For leader:
+    //
+    // If there exists an N such that N > commitIndex, a majority
+    // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+    // set commitIndex = N (§5.3, §5.4).
+    void updateCommitIndex();
 
 public:
 
@@ -278,6 +297,7 @@ private:
     int _commitIndex {};
 
     // index of highest log entry applied to state machine
+    // Note: unused!
     int _lastApplied {};
 
     // Finite State Machine

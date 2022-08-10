@@ -41,7 +41,15 @@ public:
     // If RPC request or response contains term T > currentTerm:
     // set currentTerm = T, convert to follower (§5.1)
     // return: convert to follower
+    //
+    // Note: follower will not convert to follower again in cxxraft.
+    // See Follower::followUp()
     virtual bool followUp(int term);
+
+    // TODO move to Raft
+    // prefer simple function rather than virtual interface
+    virtual bool updateLog(int prevLogIndex, int prevLogTerm,
+                           Log::EntriesArray entries, int leaderCommit);
 
 protected:
 

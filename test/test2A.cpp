@@ -1,7 +1,6 @@
-#include <unistd.h>
-#include <sys/wait.h>
 #include "cxxraft.hpp"
 #include "co.hpp"
+#include "test.h"
 
 void testInitialElection2A() {
 
@@ -13,11 +12,7 @@ void testInitialElection2A() {
     }
 
     int servers = 3;
-    std::vector<trpc::Endpoint> peers {
-        {"127.0.0.1", 2335},
-        {"127.0.0.1", 2336},
-        {"127.0.0.1", 2337}
-    };
+    auto peers = createPeers(servers);
     std::vector<std::shared_ptr<cxxraft::Raft>> rafts;
     auto config = cxxraft::Config::make(peers);
 
@@ -67,11 +62,7 @@ void testReElection2A() {
     }
 
     int servers = 3;
-    std::vector<trpc::Endpoint> peers {
-        {"127.0.0.1", 2338},
-        {"127.0.0.1", 2339},
-        {"127.0.0.1", 2340}
-    };
+    auto peers = createPeers(servers);
     auto config = cxxraft::Config::make(peers);
 
     for(size_t i = 0; i < peers.size(); ++i) {
@@ -125,10 +116,7 @@ void testManyElections2A() {
     }
 
     int servers = 7;
-    std::vector<trpc::Endpoint> peers;
-    for(auto i {0}; i < servers; ++i) {
-        peers.emplace_back("127.0.0.1", 2333 + i);
-    }
+    auto peers = createPeers(servers);
 
     auto config = cxxraft::Config::make(peers);
 
@@ -175,56 +163,15 @@ void testManyElections2A() {
 
 int main() {
 
-    using TestFunction = void(*)();
-
-    TestFunction test[] = {
+    TestFunction tests[] {
         testInitialElection2A,
         testReElection2A,
         testManyElections2A
     };
 
-    constexpr size_t TESTCASES = sizeof(test) / sizeof(TestFunction);
+    constexpr auto round = 10;
 
-    auto runTest = [](TestFunction func) {
-        dlog::Log::init();
-        auto &env = co::open();
-        env.createCoroutine(func)->resume();
-        co::loop();
-    };
-
-    // [testcase][success, failed]
-    std::vector<std::tuple<int, int>> results(TESTCASES);
-
-    auto done = [&results](int testcase, int ret) {
-        auto &[success, failed] = results[testcase];
-        if(ret) {
-            failed++;
-            std::cerr << "====FAILED====" << std::endl;
-        }
-        else success++;
-    };
-
-    for(int testcase = 0; testcase < TESTCASES; ++testcase) {
-        for(int round = 0; round < 10; round++) {
-            if(int pid, ret; pid = ::fork()) {
-                ::waitpid(pid, &ret, 0);
-                done(testcase, ret);
-            } else {
-                std::cout << "case: " << testcase << ", "
-                          << "round: " << round << std::endl;
-                runTest(test[testcase]);
-            }
-        }
-    }
-
-    // report
-    for(int testcase = 0; testcase < TESTCASES; ++testcase) {
-        auto [success, failed] = results[testcase];
-        std::cout << "====TEST CASE " << testcase << "====" << std::endl
-                  << "Done:    " << success + failed << std::endl
-                  << "Success: " << success << std::endl
-                  << "Failed:  " << failed << std::endl;
-    }
+    runTestsAndReport(tests, round);
 
     return 0;
 }
