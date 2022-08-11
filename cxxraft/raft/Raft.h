@@ -207,13 +207,13 @@ public:
     //
     // MIT-6.824 recommends that 1 second is better
     constexpr static auto RAFT_ELECTION_TIMEOUT
-        { std::chrono::milliseconds(800) };
+        { std::chrono::milliseconds(300) };
 
     constexpr static auto RAFT_ELECTION_TIMEOUT_MIN
-        { std::chrono::milliseconds(400) };
+        { std::chrono::milliseconds(150) };
 
     constexpr static auto RAFT_ELECTION_TIMEOUT_MAX
-        { std::chrono::milliseconds(800) };
+        { std::chrono::milliseconds(300) };
 
     // Same as etcd-raft heartbeat interval
     // (less than RAFT_ELECTION_TIMEOUT_MIN)

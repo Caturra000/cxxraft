@@ -289,4 +289,17 @@ void testBackup2B() {
 
 int main() {
 
+    TestFunction tests[] {
+        testBasicAgree2B,
+        testFailAgree2B,
+        testFailNoAgree2B,
+        testRejoin2B,
+        testBackup2B
+    };
+
+    constexpr auto round = 10;
+
+    runTestsAndReport(tests, round);
+
+    return 0;
 }

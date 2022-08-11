@@ -136,7 +136,7 @@ public:
     int size() {
         if(!_entries) return 0;
         int last = std::min<int>(_last, _entries->size());
-        return last - _first;
+        return std::max(last - _first, 0);
     }
 
 private:

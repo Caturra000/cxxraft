@@ -386,90 +386,112 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
     auto ping = [this, transaction](int id) {
 
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthorityToClients");
+        // retry for appendEntries, not heartbeat
+        bool retry = false;
 
-        if(!isValidTransaction(transaction)) return;
+        do {
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "ping to peer", id);
 
-        auto &peer = _peers[id];
-
-        auto client = trpc::Client::make(peer.endpoint);
-
-        if(!client) return;
-
-        if(!isValidTransaction(transaction)) return;
-
-        // for config test
-        if(callDisabled()) return;
-
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id);
-
-        // TODO conflict log
-
-        // If last log index ≥ nextIndex for a follower: send
-        // AppendEntries RPC with log entries starting at nextIndex
-        int prevLogIndex = 0;
-        int prevLogTerm = 0;
-        Log::EntriesSlice slice;
-        if(_log.lastIndex() >= peer.nextIndex) {
-            int nextIndex = peer.nextIndex;
-            prevLogIndex = nextIndex - 1;
-            prevLogTerm = Log::getTerm(_log.get(prevLogIndex));
-            slice = _log.fork(nextIndex, nextIndex + 1, Log::ByReference{});
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "send AppendEntries RPC with log entries starting at",
-                "nextIndex:", nextIndex,
-                "to node:", id,
-                "entries:", dump(slice));
-        }
-
-        bool isHeartbeat = slice.size() == 0;
-
-        auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id,
-            prevLogIndex, prevLogTerm, slice, _commitIndex);
-
-        if(!isValidTransaction(transaction)) return;
-
-        if(!reply) {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "no reply in client");
-            return;
-        }
-
-        auto [term, success] = reply->cast();
-
-        // junk
-        if(term < 0) {
-            return;
-        }
-
-        // stale leader
-        if(_fsm->followUp(term)) {
-            return;
-        }
-
-        // heartbeat only
-        if(isHeartbeat) {
-            return;
-        }
-
-        // * If successful: update nextIndex and matchIndex for
-        //   follower (§5.3)
-        // * If AppendEntries fails because of log inconsistency:
-        //   decrement nextIndex and retry (§5.3)
-
-        // Note. ignore old term commit
-        if(success) {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "before update peer", id, "matchIndex:", peer.matchIndex, "nextIndex:", peer.nextIndex);
-            peer.matchIndex = std::max(peer.matchIndex, prevLogIndex + slice.size());
-            peer.nextIndex = std::min(peer.nextIndex + slice.size(), _log.lastIndex() + 1);
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "update peer", id, "matchIndex:", peer.matchIndex, "nextIndex:", peer.nextIndex);
-            // FIXME performance
-            updateCommitIndexForSender();
-        } else {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "AppendEntries fails because of log inconsistency. peer id:", id);
-            if(peer.nextIndex <= 0) {
-                CXXRAFT_LOG_WTF(simpleInfo(), "empty log failed? nextIndex:", peer.nextIndex);
+            if(retry) {
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "retry due to failure or synchronization. peer:", id);
             }
-            peer.nextIndex--;
-        }
+
+            // reset
+            retry = false;
+
+            if(!isValidTransaction(transaction)) return;
+
+            auto &peer = _peers[id];
+
+            auto client = trpc::Client::make(peer.endpoint);
+
+            if(!client) return;
+
+            if(!isValidTransaction(transaction)) return;
+
+            // for config test
+            if(callDisabled()) return;
+
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id);
+
+            // TODO conflict log
+
+            // If last log index ≥ nextIndex for a follower: send
+            // AppendEntries RPC with log entries starting at nextIndex
+            int prevLogIndex = 0;
+            int prevLogTerm = 0;
+            Log::EntriesArray slice;
+            if(_log.lastIndex() >= peer.nextIndex) {
+                int nextIndex = peer.nextIndex;
+                prevLogIndex = nextIndex - 1;
+                prevLogTerm = Log::getTerm(_log.get(prevLogIndex));
+                slice = _log.fork(nextIndex, nextIndex + 1);
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "send AppendEntries RPC with log entries starting at",
+                    "nextIndex:", nextIndex,
+                    "to node:", id,
+                    "entries:", dump(slice));
+            }
+
+            bool isHeartbeat = slice.size() == 0;
+
+            auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id,
+                                        prevLogIndex, prevLogTerm, slice, _commitIndex);
+
+            if(!isValidTransaction(transaction)) {
+                return;
+            }
+
+            if(!reply) {
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "no reply in client");
+                return;
+            }
+
+            auto [term, success] = reply->cast();
+
+            // junk
+            if(term < 0) {
+                return;
+            }
+
+            // stale leader
+            if(_fsm->followUp(term)) {
+                return;
+            }
+
+            // heartbeat only
+            if(isHeartbeat) {
+                return;
+            }
+
+            // * If successful: update nextIndex and matchIndex for
+            //   follower (§5.3)
+            // * If AppendEntries fails because of log inconsistency:
+            //   decrement nextIndex and retry (§5.3)
+
+            // Note. ignore old term commit
+            if(success) {
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "before update peer", id, "matchIndex:", peer.matchIndex, "nextIndex:", peer.nextIndex);
+
+                peer.matchIndex = std::max<int>(peer.matchIndex, prevLogIndex + slice.size());
+                peer.nextIndex = std::min<int>(peer.nextIndex + slice.size(), _log.lastIndex() + 1);
+
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "update peer", id, "matchIndex:", peer.matchIndex, "nextIndex:", peer.nextIndex);
+                // FIXME performance
+                updateCommitIndexForSender();
+                // optimization
+                if(_log.lastIndex() >= peer.nextIndex) {
+                    retry = true;
+                }
+            } else {
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "AppendEntries fails because of log inconsistency. peer id:", id);
+                if(peer.nextIndex <= 0) {
+                    CXXRAFT_LOG_WTF(simpleInfo(), "empty log failed? nextIndex:", peer.nextIndex);
+                }
+                peer.nextIndex--;
+                // retry immediately
+                retry = true;
+            }
+        } while(retry);
     };
 
     for(auto &&kv : _peers) {

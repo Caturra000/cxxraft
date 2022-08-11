@@ -26,22 +26,29 @@ struct Debugger {
 
     std::string dump(Log::EntriesArray entries) {
         vsjson::Json json = entries;
-        return json.dump();
+        return chatty(json.dump());
     }
 
     std::string dump(Log::EntriesSlice entries) {
         vsjson::Json json = entries;
-        return json.dump();
+        return chatty(json.dump());
     }
 
     std::string dump(Command command) {
         vsjson::Json json = command;
-        return json.dump();
+        return chatty(json.dump());
     }
 
 private:
 
     Self* crtp() { return static_cast<Self*>(this); }
+
+    std::string chatty(std::string s, size_t size = 128) {
+        if(s.size() <= size) {
+            return s;
+        }
+        return s.substr(0, size / 2) + "<IGNORE>" + s.substr(s.size() - size / 2, size / 2);
+    }
 
 };
 
