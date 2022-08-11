@@ -57,6 +57,10 @@ inline bool Raft::State::updateLog(int prevLogIndex, int prevLogTerm, Log::Entri
 
     // Append
     for(auto &&entry : entries) {
+        // Note: `nextIndex` and `matchIndex` are volatile
+        if(_master->_log.lastIndex() >= Log::getIndex(entry)) {
+            continue;
+        }
         _master->_log.append(std::move(entry));
     }
 

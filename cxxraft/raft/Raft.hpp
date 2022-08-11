@@ -420,12 +420,12 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
             // AppendEntries RPC with log entries starting at nextIndex
             int prevLogIndex = 0;
             int prevLogTerm = 0;
-            Log::EntriesArray slice;
+            Log::EntriesSlice slice;
             if(_log.lastIndex() >= peer.nextIndex) {
                 int nextIndex = peer.nextIndex;
                 prevLogIndex = nextIndex - 1;
                 prevLogTerm = Log::getTerm(_log.get(prevLogIndex));
-                slice = _log.fork(nextIndex, nextIndex + 1);
+                slice = _log.fork(nextIndex, nextIndex + 1, Log::ByReference{});
                 CXXRAFT_LOG_DEBUG(simpleInfo(), "send AppendEntries RPC with log entries starting at",
                     "nextIndex:", nextIndex,
                     "to node:", id,
@@ -487,9 +487,18 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                 if(peer.nextIndex <= 0) {
                     CXXRAFT_LOG_WTF(simpleInfo(), "empty log failed? nextIndex:", peer.nextIndex);
                 }
-                peer.nextIndex--;
                 // retry immediately
                 retry = true;
+                // Optimization: fast backup
+                // nextIndex <= lastIndex
+                int failTerm = Log::getTerm(_log.get(peer.nextIndex));
+                // peer.nextIndex >= 1 (== 0 will not fail), nextRetryIndex >= 0
+                int nextRetryIndex = peer.nextIndex - 1;
+                // ensure valid decrement (at least start from placeholder 0) and ignore the same term
+                while(nextRetryIndex - 1 >= 0 && Log::getTerm(_log.get(nextRetryIndex)) == failTerm) {
+                    nextRetryIndex--;
+                }
+                peer.nextIndex = std::min(peer.nextIndex - 1, nextRetryIndex);
             }
         } while(retry);
     };
