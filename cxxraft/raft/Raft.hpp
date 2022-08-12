@@ -340,11 +340,14 @@ inline auto Raft::gatherVotesFromClients(size_t transaction) -> std::shared_ptr<
         auto [term, voteGranted] = reply->cast();
         CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. vote reply:", term, voteGranted);
 
-        // junk
-        if(term < 0) {
+        // junk or stale
+        if(term < _currentTerm) {
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. old term vote:", term);
             return;
         }
 
+        // term > _currentTerm
+        // `_fsm` must be candidate
         if(_fsm->followUp(term)) {
             return;
         }
@@ -355,19 +358,12 @@ inline auto Raft::gatherVotesFromClients(size_t transaction) -> std::shared_ptr<
             return;
         }
 
-        if(term < _currentTerm) {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. old term vote:", term);
-            return;
-        }
-
         // @paper
         //
         // A candidate wins an election if it receives votes from
         // a majority of the servers in the full cluster for the same
         // term.
-        if(term == _currentTerm) {
-            voted++;
-        }
+        voted++;
 
         CXXRAFT_LOG_DEBUG(simpleInfo(), "gatherVote. current voteInfo:", voted, rejected);
     };
