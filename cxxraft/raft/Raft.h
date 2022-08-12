@@ -133,7 +133,6 @@ private:
 
 // perform can be called by state machine only
 // all perform functions should be executed endless
-// TODO move to FSM
 private:
 
     void performElection();
@@ -184,6 +183,10 @@ private:
     void updateCommitIndexForSender();
 
     std::optional<Log::Entry> getCommittedCopy(int index);
+
+    bool updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray entries);
+
+    void updateCommitIndexForReceiver(int leaderCommit);
 
 public:
 

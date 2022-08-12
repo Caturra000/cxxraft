@@ -610,4 +610,65 @@ inline std::optional<Log::Entry> Raft::getCommittedCopy(int index) {
     return _log.get(index, Log::Optional{});
 }
 
+inline bool Raft::updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray entries) {
+    CXXRAFT_LOG_DEBUG(simpleInfo(), "updateLog:", dump(entries));
+
+    Log::Entry *pEntry;
+
+    // Reply false if log doesn’t contain an entry at prevLogIndex
+    // whose term matches prevLogTerm
+    pEntry = _log.get(prevLogIndex, Log::ByPointer{});
+    if(pEntry && Log::getTerm(*pEntry) != prevLogTerm) {
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "reply false. prevLogTerm dismatch.",
+            "prevLogIndex:", prevLogIndex,
+            "prevLogTerm:", prevLogTerm,
+            "localLogTerm:", Log::getTerm(*pEntry));
+        return false;
+    }
+
+    // If an existing entry conflicts with a new one (same index
+    // but different terms), delete the existing entry and all that
+    // follow it (§5.3)
+    for(auto &&remoteEntry : entries) {
+        int index = Log::getIndex(remoteEntry);
+        int remoteTerm = Log::getTerm(remoteEntry);
+        pEntry = _log.get(index, Log::ByPointer{});
+        if(pEntry && Log::getTerm(*pEntry) != remoteTerm) {
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "conflict log,",
+                "index:", index,
+                "last index:", _log.lastIndex(),
+                "local entries:", dump(_log.fork()));
+
+            _log.truncate(index);
+
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "truncated:", index,
+                "last:", _log.lastIndex(),
+                "local entries:", dump(_log.fork()));
+            break;
+        }
+    }
+
+    // Append
+    for(auto &&entry : entries) {
+        // Note: `nextIndex` and `matchIndex` are volatile
+        if(_log.lastIndex() >= Log::getIndex(entry)) {
+            continue;
+        }
+        _log.append(std::move(entry));
+    }
+
+    return true;
+}
+
+inline void Raft::updateCommitIndexForReceiver(int leaderCommit) {
+    // If leaderCommit > commitIndex, set commitIndex =
+    // min(leaderCommit, index of last new entry)
+    if(leaderCommit > _commitIndex) {
+        _commitIndex = std::min(leaderCommit, _log.lastIndex());
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "got latest commit index:", _commitIndex);
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "dump log", dump(_log.fork()));
+        // _lastApplied...
+    }
+}
+
 } // cxxraft

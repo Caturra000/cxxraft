@@ -17,67 +17,6 @@ inline bool Raft::State::followUp(int term) {
     return false;
 }
 
-inline bool Raft::State::updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray entries, int leaderCommit) {
-
-    CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "updateLog:", _master->dump(entries));
-
-    Log::Entry *pEntry;
-
-    // Reply false if log doesn’t contain an entry at prevLogIndex
-    // whose term matches prevLogTerm
-    pEntry = _master->_log.get(prevLogIndex, Log::ByPointer{});
-    if(pEntry && Log::getTerm(*pEntry) != prevLogTerm) {
-        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "reply false. prevLogTerm dismatch.",
-            "prevLogIndex:", prevLogIndex,
-            "prevLogTerm:", prevLogTerm,
-            "localLogTerm:", Log::getTerm(*pEntry));
-        return false;
-    }
-
-    // If an existing entry conflicts with a new one (same index
-    // but different terms), delete the existing entry and all that
-    // follow it (§5.3)
-    for(auto &&remoteEntry : entries) {
-        int index = Log::getIndex(remoteEntry);
-        int remoteTerm = Log::getTerm(remoteEntry);
-        pEntry = _master->_log.get(index, Log::ByPointer{});
-        if(pEntry && Log::getTerm(*pEntry) != remoteTerm) {
-            CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "conflict log, index:", index,
-                "last:", _master->_log.lastIndex(),
-                "local entries:", _master->dump(_master->_log.fork()));
-
-            _master->_log.truncate(index);
-
-            CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "truncated:", index,
-                "last:", _master->_log.lastIndex(),
-                "local entries:", _master->dump(_master->_log.fork()));
-            break;
-        }
-    }
-
-    // Append
-    for(auto &&entry : entries) {
-        // Note: `nextIndex` and `matchIndex` are volatile
-        if(_master->_log.lastIndex() >= Log::getIndex(entry)) {
-            continue;
-        }
-        _master->_log.append(std::move(entry));
-    }
-
-    return true;
-}
-
-inline void Raft::State::updateCommitIndexForReceiver(int leaderCommit) {
-    // If leaderCommit > commitIndex, set commitIndex =
-    // min(leaderCommit, index of last new entry)
-    if(leaderCommit > _master->_commitIndex) {
-        _master->_commitIndex = std::min(leaderCommit, _master->_log.lastIndex());
-        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "got latest commit index:", _master->_commitIndex);
-        CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "dump log", _master->dump(_master->_log.fork()));
-        // _lastApplied...
-    }
-}
-
 
 
 
@@ -119,9 +58,6 @@ inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId,
 
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC: ", term, leaderId, prevLogIndex, prevLogTerm);
 
-    // TODO delete
-    // currently peers don't care about the reply
-
     if(!isValidTransaction()) {
         return std::make_tuple(Raft::JUNK_TERM, false);
     }
@@ -130,22 +66,20 @@ inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId,
         return std::make_tuple(_master->_currentTerm, false);
     }
 
-    bool changed = followUp(term);
-
-    // World has changed
-    if(changed) {
-        // if emtpy entry, return true for up-to-date heartbeat
-        // else return what updateLog() returns
-        bool ret = entries.empty() ||
-            updateLog(prevLogIndex, prevLogTerm, std::move(entries), leaderCommit);
-
-        updateCommitIndexForReceiver(leaderCommit);
-        return std::make_tuple(_master->_currentTerm, ret);
+    if(!followUp(term)) {
+        CXXRAFT_LOG_WTF(_master->simpleInfo(), "I am the only leader in this term, you too?");
+        return std::make_tuple(_master->_currentTerm, false);
     }
 
-    CXXRAFT_LOG_WTF(_master->simpleInfo(), "I am the only leader in this term, you too?");
+    // World has changed
 
-    return std::make_tuple(_master->_currentTerm, false);
+    // if emtpy entry, return true for up-to-date heartbeat
+    // else return what updateLog() returns
+    bool ret = entries.empty() ||
+        _master->updateLog(prevLogIndex, prevLogTerm, std::move(entries));
+
+    _master->updateCommitIndexForReceiver(leaderCommit);
+    return std::make_tuple(_master->_currentTerm, ret);
 }
 
 inline Reply<int, bool> Leader::onRequestVoteRPC(int term, int candidateId,
@@ -220,9 +154,9 @@ inline Reply<int, bool> Follower::onAppendEntryRPC(int term, int leaderId,
     followUp(term);
 
     bool ret = entries.empty() ||
-        updateLog(prevLogIndex, prevLogTerm, std::move(entries), leaderCommit);
+        _master->updateLog(prevLogIndex, prevLogTerm, std::move(entries));
 
-    updateCommitIndexForReceiver(leaderCommit);
+    _master->updateCommitIndexForReceiver(leaderCommit);
 
     return std::make_tuple(_master->_currentTerm, ret);
 }
@@ -319,9 +253,9 @@ inline Reply<int, bool> Candidate::onAppendEntryRPC(int term, int leaderId,
     }
 
     bool ret = entries.empty() ||
-        updateLog(prevLogIndex, prevLogTerm, std::move(entries), leaderCommit);
+        _master->updateLog(prevLogIndex, prevLogTerm, std::move(entries));
 
-    updateCommitIndexForReceiver(leaderCommit);
+    _master->updateCommitIndexForReceiver(leaderCommit);
 
     return std::make_tuple(_master->_currentTerm, ret);
 }

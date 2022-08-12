@@ -46,14 +46,6 @@ public:
     // See Follower::followUp()
     virtual bool followUp(int term);
 
-    // TODO move to Raft
-    // prefer simple function rather than virtual interface
-    virtual bool updateLog(int prevLogIndex, int prevLogTerm,
-                           Log::EntriesArray entries, int leaderCommit);
-
-    // TODO move to Raft
-    virtual void updateCommitIndexForReceiver(int leaderCommit);
-
 protected:
 
     bool isValidTransaction() { return _master->isValidTransaction(_transaction); }
