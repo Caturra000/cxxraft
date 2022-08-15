@@ -211,4 +211,29 @@ inline int Config::one(Command command, int expectedServers, bool retry) {
     return -1;
 }
 
+inline void Config::crash(int id) {
+    auto iter = _rafts.find(id);
+    if(iter == _rafts.end()) {
+        return;
+    }
+    disconnect(id);
+    auto pRaft = iter->second;
+    pRaft->_rpcServer->close();
+    // TODO stop `Storage`
+
+    // leave detached coroutines
+    _killed.emplace_back(pRaft);
+    _rafts.erase(iter);
+}
+
+inline void Config::start(int id) {
+    crash(id);
+
+    auto raft = Raft::make(_peers, id);
+    _rafts[id] = raft;
+    _connected[id] = true;
+
+    raft->start();
+}
+
 } // cxxraft

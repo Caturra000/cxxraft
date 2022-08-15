@@ -7,8 +7,7 @@ void testBasicAgree2B() {
     int servers = peers.size();
     auto config = cxxraft::Config::make(peers);
     for(size_t i = 0; i < peers.size(); ++i) {
-        auto raft = cxxraft::Raft::make(*config, i);
-        raft->start();
+        config->start(i);
     }
     config->begin("Test (2B): basic agreement");
 
@@ -38,8 +37,7 @@ void testFailAgree2B() {
     auto peers = createPeers(servers);
     auto config = cxxraft::Config::make(peers);
     for(size_t i = 0; i < peers.size(); ++i) {
-        auto raft = cxxraft::Raft::make(*config, i);
-        raft->start();
+        config->start(i);
     }
 
     config->begin("Test (2B): agreement despite follower disconnection");
@@ -87,8 +85,7 @@ void testFailNoAgree2B() {
     auto config = cxxraft::Config::make(peers);
 
     for(size_t i = 0; i < peers.size(); ++i) {
-        auto raft = cxxraft::Raft::make(*config, i);
-        raft->start();
+        config->start(i);
     }
 
     config->begin("Test (2B): no agreement if too many followers disconnect");
@@ -155,8 +152,7 @@ void testRejoin2B() {
     auto config = cxxraft::Config::make(peers);
 
     for(size_t i = 0; i < peers.size(); ++i) {
-        auto raft = cxxraft::Raft::make(*config, i);
-        raft->start();
+        config->start(i);
     }
 
     config->begin("Test (2B): rejoin of partitioned leader");
@@ -208,8 +204,7 @@ void testBackup2B() {
     auto config = cxxraft::Config::make(peers);
 
     for(size_t i = 0; i < peers.size(); ++i) {
-        auto raft = cxxraft::Raft::make(*config, i);
-        raft->start();
+        config->start(i);
     }
 
     config->begin("Test (2B): leader backs up quickly over incorrect follower logs");

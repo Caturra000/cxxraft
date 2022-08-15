@@ -1,19 +1,19 @@
 #pragma once
 #include "raft/Raft.h"
-#include "raft/Config.h"
 #include "raft/State.h"
 namespace cxxraft {
 
-inline Raft::Raft(Config &config, int id)
-    : _self(config._peers[id]),
+inline Raft::Raft(const std::vector<trpc::Endpoint> &peers, int id)
+    : _self(peers[id]),
       _id(id),
+      _storage(std::make_shared<Storage>()),
       _currentTerm(0),
       _fsm(nullptr),
       _transaction(0)
 {
-    for(size_t i = 0; i < config._peers.size(); i++) {
+    for(size_t i = 0; i < peers.size(); i++) {
         if(i != id) {
-            _peers.try_emplace(i, i, config._peers[i]);
+            _peers.try_emplace(i, i, peers[i]);
         }
     }
 
@@ -65,11 +65,8 @@ inline void Raft::start() {
     // client coroutines will start in further state
 }
 
-inline std::shared_ptr<Raft> Raft::make(Config &config, int id) {
-    auto raft = std::make_shared<Raft>(config, id);
-    // for test
-    config._rafts.emplace_back(raft);
-    config._connected[id] = true;
+inline std::shared_ptr<Raft> Raft::make(const std::vector<trpc::Endpoint> &peers, int id) {
+    auto raft = std::make_shared<Raft>(peers, id);
     return raft;
 }
 

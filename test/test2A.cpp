@@ -17,8 +17,7 @@ void testInitialElection2A() {
     auto config = cxxraft::Config::make(peers);
 
     for(size_t i = 0; i < peers.size(); ++i) {
-        auto raft = cxxraft::Raft::make(*config, i);
-        raft->start();
+        config->start(i);
     }
 
     config->begin("Test (2A): initial election");
@@ -66,8 +65,7 @@ void testReElection2A() {
     auto config = cxxraft::Config::make(peers);
 
     for(size_t i = 0; i < peers.size(); ++i) {
-        auto raft = cxxraft::Raft::make(*config, i);
-        raft->start();
+        config->start(i);
     }
 
     config->begin("Test (2A): election after network failure");
@@ -121,8 +119,7 @@ void testManyElections2A() {
     auto config = cxxraft::Config::make(peers);
 
     for(size_t i = 0; i < peers.size(); ++i) {
-        auto raft = cxxraft::Raft::make(*config, i);
-        raft->start();
+        config->start(i);
     }
 
     config->begin("Test (2A): multiple elections");

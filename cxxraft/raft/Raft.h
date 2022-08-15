@@ -27,7 +27,7 @@ public:
 
     void start();
 
-    static std::shared_ptr<Raft> make(Config &config, int id);
+    static std::shared_ptr<Raft> make(const std::vector<trpc::Endpoint> &peers, int id);
 
     // Ask a Raft for its current term, and whether it thinks it is leader
     // return: [term, isLeader] <std::tuple<int, bool>>
@@ -62,7 +62,8 @@ public:
 // public for std::make_shared
 public:
 
-    Raft(Config &config, int id);
+    // peers: including itself
+    Raft(const std::vector<trpc::Endpoint> &peers, int id);
 
 public:
 
@@ -277,7 +278,11 @@ private:
     int _id;
 
     // Log or configuration
-    Storage _storage;
+    //
+    // non-null
+    //
+    // TODO
+    std::shared_ptr<Storage> _storage;
 
     // latest term server has seen (initialized to 0
     // on first boot, increases monotonically)

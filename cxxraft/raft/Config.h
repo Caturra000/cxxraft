@@ -49,6 +49,20 @@ struct Config: private Debugger<Config> {
     // to simplify the early Lab 2B tests.
     int one(Command command, int expectedServers, bool retry);
 
+//////////// for 2C
+
+    // shut down a Raft server but **NOT** save its persistent state.
+    //
+    // NOTE:
+    // it is slightly different from 6.824.
+    // `crash` does NOT explicitly save its persistent state
+    // Raft server will restore commited log from WAL
+    void crash(int id);
+
+    // start or re-start a Raft.
+    // if one already exists, "kill" it first.
+    void start(int id);
+
 //////////// verbose
 
     void begin(const char *test) { std::cout << "begin: " << test << std::endl; }
@@ -59,7 +73,9 @@ struct Config: private Debugger<Config> {
 
     std::vector<trpc::Endpoint> _peers;
 
-    std::vector<std::shared_ptr<Raft>> _rafts;
+    std::map<int, std::shared_ptr<Raft>> _rafts;
+
+    std::vector<std::shared_ptr<Raft>> _killed;
 
 };
 
