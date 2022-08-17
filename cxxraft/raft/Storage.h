@@ -49,6 +49,8 @@ public:
 
     Storage(std::string path);
 
+    ~Storage();
+
 public:
 
     // whatever...
@@ -98,16 +100,16 @@ inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::Entrie
     ::fstat(_fd, &st);
     off_t size = st.st_size;
 
+    if(size == 0) {
+        CXXRAFT_LOG_DEBUG("empty file. ignored");
+        return std::nullopt;
+    }
+
     /// read file and make buffer
 
     std::string sbuf;
     sbuf.reserve(size);
     char *buf = sbuf.data();
-
-    if(sbuf.empty()) {
-        CXXRAFT_LOG_DEBUG("empty file. ignored");
-        return std::nullopt;
-    }
 
     if(int n = ::read(_fd, buf, sbuf.size()); n ^ sbuf.size()) {
         CXXRAFT_LOG_ERROR("read failed. read bytes:", n);
@@ -265,6 +267,12 @@ inline Storage::Storage(std::string path)
         _fd = IN_MEMORY_OR_NO_FD;
     } else {
         CXXRAFT_LOG_INFO("preapre for storage. path:", _path);
+    }
+}
+
+inline Storage::~Storage() {
+    if(_fd != IN_MEMORY_OR_NO_FD) {
+        ::close(_fd);
     }
 }
 
