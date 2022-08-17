@@ -94,16 +94,26 @@ inline bool Storage::backup(int currentTerm, int voteFor, Log::EntriesSlice entr
 inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::EntriesArray>> {
     if(isInMemory()) return std::nullopt;
 
+    CXXRAFT_LOG_DEBUG("restore from fd", _fd);
+
     /// get file size
 
     struct stat st;
     ::fstat(_fd, &st);
     off_t size = st.st_size;
 
+    // first time
     if(size == 0) {
         CXXRAFT_LOG_DEBUG("empty file. ignored");
+        writeCurrentTerm(0);
+        writeVoteFor(-1);
+        // get placeholder
+        writeLog(Log{}.fork());
+        sync();
         return std::nullopt;
     }
+
+    CXXRAFT_LOG_DEBUG("get file size:", size);
 
     /// read file and make buffer
 
@@ -111,7 +121,7 @@ inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::Entrie
     sbuf.reserve(size);
     char *buf = sbuf.data();
 
-    if(int n = ::read(_fd, buf, sbuf.size()); n ^ sbuf.size()) {
+    if(int n = ::read(_fd, buf, sbuf.capacity()); n ^ sbuf.capacity()) {
         CXXRAFT_LOG_ERROR("read failed. read bytes:", n);
         return std::nullopt;
     }
@@ -120,13 +130,14 @@ inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::Entrie
 
     off_t consumed = 0;
 
-    int currentTerm = -1;
+    int currentTerm = 0;
     // TODO optional voteFor
     int voteFor = -1;
     Log::EntriesArray entries;
 
     auto consumeInt = [&] {
         int v = *reinterpret_cast<int*>(buf + consumed);
+        CXXRAFT_LOG_DEBUG("consumeInt. int:", v);
         consumed += sizeof(int);
         return v;
     };
@@ -135,6 +146,7 @@ inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::Entrie
         const char *cursor = buf;
         // TODO refactor
         auto json = vsjson::parser::parseImpl(cursor);
+        CXXRAFT_LOG_DEBUG("consumeJson. json:", json.dump());
         consumed += std::distance(buf, cursor);
         return json;
     };
@@ -142,6 +154,7 @@ inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::Entrie
     auto redoAppend = [&] {
         auto json = consumeJson(buf + consumed);
         Log::EntriesArray parsed {json.as<vsjson::ArrayImpl>()};
+        CXXRAFT_LOG_DEBUG("redo append. log:", json.dump());
         for(auto &&entry : parsed) {
             entries.emplace_back(std::move(entry));
         }
@@ -150,6 +163,7 @@ inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::Entrie
     auto redoLog = [&] {
         auto json = consumeJson(buf + consumed);
         entries = json.as<vsjson::ArrayImpl>();
+        CXXRAFT_LOG_DEBUG("redo log. log:", json.dump());
     };
 
     auto redoTruncate = [&] {
@@ -158,9 +172,11 @@ inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::Entrie
                 && Log::getIndex(entries.back()) >= index) {
             entries.pop_back();
         }
+        CXXRAFT_LOG_DEBUG("redo truncate. index:", index);
     };
 
-    while(consumed < sbuf.size()) {
+    while(consumed < sbuf.capacity()) {
+        CXXRAFT_LOG_DEBUG("consuming. consumed:", consumed, "opcode:", buf[consumed]);
         switch(buf[consumed++]) {
         case OP_APPEND:
             redoAppend();
@@ -181,12 +197,13 @@ inline auto Storage::restore() -> std::optional<std::tuple<int, int, Log::Entrie
             CXXRAFT_LOG_WTF("unknwon opcode:", buf[consumed - 1]);
         }
     }
+    CXXRAFT_LOG_DEBUG("consumed:", consumed);
     return std::make_tuple(currentTerm, voteFor, std::move(entries));
 }
 
 inline bool Storage::writeCurrentTerm(int currentTerm) {
     if(isInMemory()) return true;
-    return writeInt(OP_VOTE_FOR, currentTerm);
+    return writeInt(OP_CURRENT_TERM, currentTerm);
 }
 
 inline bool Storage::writeVoteFor(int voteFor) {
@@ -225,6 +242,7 @@ inline bool Storage::appendLog(Log::EntriesArray array) {
 
 inline void Storage::sync() {
     if(isInMemory()) return;
+    CXXRAFT_LOG_DEBUG("commited. fd:", _fd);
     ::fsync(_fd);
 }
 
@@ -266,7 +284,7 @@ inline Storage::Storage(std::string path)
         CXXRAFT_LOG_WARN("switch to in-memory mode");
         _fd = IN_MEMORY_OR_NO_FD;
     } else {
-        CXXRAFT_LOG_INFO("preapre for storage. path:", _path);
+        CXXRAFT_LOG_INFO("preapre for storage. path:", _path, "fd:", _fd);
     }
 }
 
@@ -283,6 +301,8 @@ inline bool Storage::writeInt(char opcode, int integer) {
     *buf = opcode;
     *fill = integer;
 
+    CXXRAFT_LOG_DEBUG("write to backing device. opcode:", opcode, "integer:", integer, "fd:", _fd);
+
     constexpr ssize_t size = sizeof(char) + sizeof(int);
     if(size != ::write(_fd, buf, size)) {
         CXXRAFT_LOG_ERROR("write failed. reason:", ::strerror(errno));
@@ -297,6 +317,9 @@ inline bool Storage::writeJson(char opcode, vsjson::Json json) {
         {.iov_base = &opcode, .iov_len = 1},
         {.iov_base = buf.data(), .iov_len = buf.size()}
     };
+
+    CXXRAFT_LOG_DEBUG("write to backing device. opcode:", opcode, "json:", json.dump(), "fd:", _fd);
+
     ssize_t size = v[0].iov_len + v[1].iov_len;
     if(::writev(_fd, v, 2) != size) {
         CXXRAFT_LOG_ERROR("write failed. reason:", ::strerror(errno));

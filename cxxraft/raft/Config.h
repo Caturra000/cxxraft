@@ -64,7 +64,7 @@ struct Config: private Debugger<Config> {
     // it is slightly different from 6.824.
     // `crash` does NOT explicitly save its persistent state
     // Raft server will restore commited log from WAL
-    void crash(int id);
+    bool crash(int id);
 
     // start or re-start a Raft.
     // if one already exists, "kill" it first.

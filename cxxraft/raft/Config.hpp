@@ -169,6 +169,7 @@ inline auto Config::nCommitted(int index) -> std::tuple<int, Command> {
 }
 
 inline int Config::one(Command command, int expectedServers, bool retry) {
+    CXXRAFT_LOG_DEBUG("one. command:", dump(command), "expectedServers:", expectedServers, "retry:", retry);
     using namespace std::chrono_literals;
     auto now = std::chrono::system_clock::now;
     auto t0 = now();
@@ -219,11 +220,14 @@ inline int Config::one(Command command, int expectedServers, bool retry) {
     return -1;
 }
 
-inline void Config::crash(int id) {
+inline bool Config::crash(int id) {
     auto iter = _rafts.find(id);
     if(iter == _rafts.end()) {
-        return;
+        return false;
     }
+
+    CXXRAFT_LOG_DEBUG("crash id:", id);
+
     disconnect(id);
     auto pRaft = iter->second;
     pRaft->_rpcServer->close();
@@ -232,10 +236,16 @@ inline void Config::crash(int id) {
     // leave detached coroutines
     _killed.emplace_back(pRaft);
     _rafts.erase(iter);
+
+    return true;
 }
 
 inline void Config::start(int id) {
-    crash(id);
+    CXXRAFT_LOG_DEBUG("start id:", id);
+    if(crash(id)) {
+        CXXRAFT_LOG_DEBUG("restart id:", id);
+    }
+
 
     std::shared_ptr<Raft> raft;
 
@@ -254,6 +264,7 @@ inline void Config::start(int id) {
 }
 
 inline cxxraft::Command Config::wait(int index, int n, int startTerm) {
+    CXXRAFT_LOG_DEBUG("wait. index:", index, "n:", n, "startTerm:", startTerm);
     using namespace std::chrono_literals;
     auto to = 10ms;
     for(auto iter = 0; iter < 30; ++iter) {

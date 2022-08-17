@@ -31,7 +31,6 @@ inline Raft::Raft(const std::vector<trpc::Endpoint> &peers, int id,
         _currentTerm = currentTerm;
         if(voteFor >= 0) _voteFor = voteFor;
         _log.set(std::move(entries));
-
     }
 
     // FIXME not 100% safe (atomic)
@@ -596,13 +595,16 @@ inline void Raft::applyEntry(int index) {
 }
 
 inline int Raft::appendEntry(Command command) {
+
+    CXXRAFT_LOG_DEBUG(simpleInfo(), "appendEntry:", dump(command));
+
     int nextIndex = _log.lastIndex() + 1;
     Log::Metadata metadata = std::make_tuple(nextIndex, _currentTerm);
     _log.append(metadata, std::move(command));
 
     // persistent
     auto singleSlice = _log.fork(_log.lastIndex(), _log.lastIndex() + 1, Log::ByReference{});
-    _storage->writeLog(singleSlice);
+    _storage->appendLog(singleSlice);
     _storage->sync();
 
     return nextIndex;
@@ -704,7 +706,7 @@ inline bool Raft::updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray
 
         // persistent
         auto singleSlice = _log.fork(_log.lastIndex(), _log.lastIndex() + 1, Log::ByReference{});
-        _storage->writeLog(singleSlice);
+        _storage->appendLog(singleSlice);
     }
     // FIXME safe?
     _storage->sync();
