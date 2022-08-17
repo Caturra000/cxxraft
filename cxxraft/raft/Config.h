@@ -5,8 +5,15 @@ namespace cxxraft {
 
 struct Config: private Debugger<Config> {
 
+    struct EnablePersistent {};
+
+    // nanosecond is enough
+    using Uuid = std::chrono::nanoseconds::rep;
+
     Config(std::vector<trpc::Endpoint> peers);
+    Config(std::vector<trpc::Endpoint> peers, EnablePersistent);
     static std::shared_ptr<Config> make(std::vector<trpc::Endpoint> peers);
+    static std::shared_ptr<Config> make(std::vector<trpc::Endpoint> peers, EnablePersistent);
 
     // connect or disconnect to local debug network
     // direct call to raft server
@@ -63,6 +70,10 @@ struct Config: private Debugger<Config> {
     // if one already exists, "kill" it first.
     void start(int id);
 
+    // wait for at least n servers to commit.
+    // but don't wait forever.
+    cxxraft::Command wait(int index, int n, int startTerm);
+
 //////////// verbose
 
     void begin(const char *test) { std::cout << "begin: " << test << std::endl; }
@@ -76,6 +87,10 @@ struct Config: private Debugger<Config> {
     std::map<int, std::shared_ptr<Raft>> _rafts;
 
     std::vector<std::shared_ptr<Raft>> _killed;
+
+    bool _persistent;
+
+    Uuid _uuid {std::chrono::system_clock::now().time_since_epoch().count()};
 
 };
 

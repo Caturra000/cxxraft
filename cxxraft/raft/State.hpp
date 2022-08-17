@@ -12,6 +12,11 @@ inline bool Raft::State::followUp(int term) {
         _master->statePost([this] {
             _master->becomeFollower();
         });
+
+        // FIXME write once
+        // FIXME writer thread
+        _master->_storage->writeCurrentTerm(term);
+        _master->_storage->writeVoteFor(-1);
         return true;
     }
     return false;
@@ -79,6 +84,10 @@ inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId,
         _master->updateLog(prevLogIndex, prevLogTerm, std::move(entries));
 
     _master->updateCommitIndexForReceiver(leaderCommit);
+
+    // must be modified
+    _master->_storage->sync();
+
     return std::make_tuple(_master->_currentTerm, ret);
 }
 
@@ -98,9 +107,13 @@ inline Reply<int, bool> Leader::onRequestVoteRPC(int term, int candidateId,
     }
 
     // check stale leader
-    followUp(term);
+    bool changed = followUp(term);
 
     bool voteGranted = _master->vote(candidateId, lastLogIndex, lastLogTerm);
+
+    if(changed || voteGranted) {
+        _master->_storage->sync();
+    }
 
     return std::make_tuple(_master->_currentTerm, voteGranted);
 }
@@ -151,12 +164,16 @@ inline Reply<int, bool> Follower::onAppendEntryRPC(int term, int leaderId,
 
     ++(*_watchdog);
 
-    followUp(term);
+    bool changed = followUp(term);
 
     bool ret = entries.empty() ||
         _master->updateLog(prevLogIndex, prevLogTerm, std::move(entries));
 
     _master->updateCommitIndexForReceiver(leaderCommit);
+
+    if(changed || ret) {
+        _master->_storage->sync();
+    }
 
     return std::make_tuple(_master->_currentTerm, ret);
 }
@@ -177,9 +194,13 @@ inline Reply<int, bool> Follower::onRequestVoteRPC(int term, int candidateId,
         return std::make_tuple(_master->_currentTerm, false);
     }
 
-    followUp(term);
+    bool changed = followUp(term);
 
     bool voteGranted = _master->vote(candidateId, lastLogIndex, lastLogTerm);
+
+    if(changed || voteGranted) {
+        _master->_storage->sync();
+    }
     return std::make_tuple(_master->_currentTerm, voteGranted);
 }
 
@@ -189,6 +210,9 @@ inline bool Follower::followUp(int term) {
         _master->_currentTerm = term;
         CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "reset vote");
         _master->_voteFor = std::nullopt;
+
+        _master->_storage->writeCurrentTerm(term);
+        _master->_storage->writeVoteFor(-1);
         return true;
     }
     return false;
@@ -257,6 +281,10 @@ inline Reply<int, bool> Candidate::onAppendEntryRPC(int term, int leaderId,
 
     _master->updateCommitIndexForReceiver(leaderCommit);
 
+    if(changed || ret) {
+        _master->_storage->sync();
+    }
+
     return std::make_tuple(_master->_currentTerm, ret);
 }
 
@@ -275,10 +303,14 @@ inline Reply<int, bool> Candidate::onRequestVoteRPC(int term, int candidateId,
         return std::make_tuple(_master->_currentTerm, false);
     }
 
-    followUp(term);
+    bool changed = followUp(term);
 
     bool voteGranted = _master->vote(candidateId, lastLogIndex, lastLogTerm);
     CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onRequestVoteRPC result:", voteGranted);
+
+    if(changed || voteGranted) {
+        _master->_storage->sync();
+    }
     return std::make_tuple(_master->_currentTerm, voteGranted);
 }
 

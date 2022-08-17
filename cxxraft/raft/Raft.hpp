@@ -4,9 +4,14 @@
 namespace cxxraft {
 
 inline Raft::Raft(const std::vector<trpc::Endpoint> &peers, int id)
+    : Raft(peers, id, std::make_shared<Storage>())
+{}
+
+inline Raft::Raft(const std::vector<trpc::Endpoint> &peers, int id,
+                  std::shared_ptr<Storage> storage)
     : _self(peers[id]),
       _id(id),
-      _storage(std::make_shared<Storage>()),
+      _storage(std::move(storage)),
       _currentTerm(0),
       _fsm(nullptr),
       _transaction(0)
@@ -17,6 +22,30 @@ inline Raft::Raft(const std::vector<trpc::Endpoint> &peers, int id)
         }
     }
 
+    if(auto coldData = _storage->restore()) {
+        auto &&[currentTerm, voteFor, entries] = *coldData;
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "restore from storage.",
+            "currentTerm:", currentTerm,
+            "voteFor", voteFor,
+            "entries:", dump(entries));
+        _currentTerm = currentTerm;
+        if(voteFor >= 0) _voteFor = voteFor;
+        _log.set(std::move(entries));
+
+    }
+
+    // FIXME not 100% safe (atomic)
+    // disabled by default
+    if(_storage->isCompress()) {
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "do WAL compress");
+        _storage->ftruncate();
+        _storage->backup(
+            _currentTerm,
+            _voteFor ? *_voteFor : -1,
+            _log.fork(Log::ByReference{})
+        );
+        _storage->sync();
+    }
 }
 
 inline void Raft::start() {
@@ -67,6 +96,12 @@ inline void Raft::start() {
 
 inline std::shared_ptr<Raft> Raft::make(const std::vector<trpc::Endpoint> &peers, int id) {
     auto raft = std::make_shared<Raft>(peers, id);
+    return raft;
+}
+
+inline std::shared_ptr<Raft> Raft::make(const std::vector<trpc::Endpoint> &peers, int id,
+                                        std::shared_ptr<Storage> storage) {
+    auto raft = std::make_shared<Raft>(peers, id, std::move(storage));
     return raft;
 }
 
@@ -166,6 +201,12 @@ inline void Raft::performElection() {
         // issues RequestVote RPCs in parallel to each of
         // the other servers in the cluster.
         _voteFor = _id;
+
+        // persistent
+        // TODO delay sync
+        _storage->writeCurrentTerm(_currentTerm);
+        _storage->writeVoteFor(_id);
+        _storage->sync();
 
         // Create asynchronous client coroutines to gather votes
         auto voteInfo = gatherVotesFromClients(transaction);
@@ -346,6 +387,7 @@ inline auto Raft::gatherVotesFromClients(size_t transaction) -> std::shared_ptr<
         // term > _currentTerm
         // `_fsm` must be candidate
         if(_fsm->followUp(term)) {
+            _storage->sync();
             return;
         }
 
@@ -448,6 +490,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
             // stale leader
             if(_fsm->followUp(term)) {
+                _storage->sync();
                 return;
             }
 
@@ -556,6 +599,12 @@ inline int Raft::appendEntry(Command command) {
     int nextIndex = _log.lastIndex() + 1;
     Log::Metadata metadata = std::make_tuple(nextIndex, _currentTerm);
     _log.append(metadata, std::move(command));
+
+    // persistent
+    auto singleSlice = _log.fork(_log.lastIndex(), _log.lastIndex() + 1, Log::ByReference{});
+    _storage->writeLog(singleSlice);
+    _storage->sync();
+
     return nextIndex;
 }
 
@@ -652,7 +701,13 @@ inline bool Raft::updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray
             continue;
         }
         _log.append(std::move(entry));
+
+        // persistent
+        auto singleSlice = _log.fork(_log.lastIndex(), _log.lastIndex() + 1, Log::ByReference{});
+        _storage->writeLog(singleSlice);
     }
+    // FIXME safe?
+    _storage->sync();
 
     return true;
 }

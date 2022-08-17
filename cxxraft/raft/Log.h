@@ -83,6 +83,8 @@ public:
     // [index, lastIndex]
     void truncate(int index);
 
+    void set(EntriesArray entries);
+
 public:
 
     // TODO restore from backing devices
@@ -231,6 +233,10 @@ inline void Log::truncate(int index) {
     while(index <= lastIndex()) {
         _entries.pop_back();
     }
+}
+
+inline void Log::set(EntriesArray entries) {
+    _entries = std::move(entries);
 }
 
 inline Log::Log() {

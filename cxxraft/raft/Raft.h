@@ -28,6 +28,8 @@ public:
     void start();
 
     static std::shared_ptr<Raft> make(const std::vector<trpc::Endpoint> &peers, int id);
+    static std::shared_ptr<Raft> make(const std::vector<trpc::Endpoint> &peers, int id,
+                                      std::shared_ptr<Storage> storage);
 
     // Ask a Raft for its current term, and whether it thinks it is leader
     // return: [term, isLeader] <std::tuple<int, bool>>
@@ -64,6 +66,9 @@ public:
 
     // peers: including itself
     Raft(const std::vector<trpc::Endpoint> &peers, int id);
+
+    Raft(const std::vector<trpc::Endpoint> &peers, int id,
+         std::shared_ptr<Storage> storage);
 
 public:
 

@@ -6,8 +6,16 @@ inline Config::Config(std::vector<trpc::Endpoint> peers)
     : _peers(peers), _connected(peers.size())
 {}
 
+inline Config::Config(std::vector<trpc::Endpoint> peers, EnablePersistent)
+    : _peers(peers), _connected(peers.size()), _persistent(true)
+{}
+
 inline std::shared_ptr<Config> Config::make(std::vector<trpc::Endpoint> peers) {
     return std::make_shared<Config>(std::move(peers));
+}
+
+inline std::shared_ptr<Config> Config::make(std::vector<trpc::Endpoint> peers, EnablePersistent) {
+    return std::make_shared<Config>(std::move(peers), EnablePersistent{});
 }
 
 inline void Config::connect(int index) {
@@ -229,11 +237,52 @@ inline void Config::crash(int id) {
 inline void Config::start(int id) {
     crash(id);
 
-    auto raft = Raft::make(_peers, id);
+    std::shared_ptr<Raft> raft;
+
+    if(_persistent) {
+        auto path = std::to_string(_uuid) + "_" + std::to_string(id) + ".wal";
+        auto storage = std::make_shared<Storage>(path);
+        raft = Raft::make(_peers, id, std::move(storage));
+    } else {
+        raft = Raft::make(_peers, id);
+    }
+
     _rafts[id] = raft;
     _connected[id] = true;
 
     raft->start();
+}
+
+inline cxxraft::Command Config::wait(int index, int n, int startTerm) {
+    using namespace std::chrono_literals;
+    auto to = 10ms;
+    for(auto iter = 0; iter < 30; ++iter) {
+        auto [nd, _] = nCommitted(index);
+        if(nd >= n) {
+            break;
+        }
+        co::poll(nullptr, 0, to.count());
+        if(to < 1s) {
+            to *= 2;
+        }
+        if(startTerm > -1) {
+            for(auto &&[id, raft] : _rafts) {
+                if(auto [t, _] = raft->getState(); t > startTerm) {
+                    // someone has moved on
+                    // can no longer guarantee that we'll "win"
+                    cxxraft::Command cmd;
+                    cmd["op"] = -1;
+                    return cmd;
+                }
+            }
+        }
+    }
+    auto [nd, cmd] = nCommitted(index);
+    if(nd < n) {
+        CXXRAFT_LOG_WTF("only", nd, "decided for index", index, "wanted", n);
+        abort();
+    }
+    return cmd;
 }
 
 } // cxxraft
