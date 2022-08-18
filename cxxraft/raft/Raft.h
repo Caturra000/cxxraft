@@ -172,8 +172,10 @@ private:
 // for log replication
 private:
 
+    // TODO remove
     void applyEntry(int index);
 
+    // TODO remove
     int appendEntry(Command command);
 
     // The second property(If two entries in different logs have the same index

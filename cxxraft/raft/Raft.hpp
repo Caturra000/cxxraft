@@ -31,6 +31,11 @@ inline Raft::Raft(const std::vector<trpc::Endpoint> &peers, int id,
         _currentTerm = currentTerm;
         if(voteFor >= 0) _voteFor = voteFor;
         _log.set(std::move(entries));
+
+        // It may be unnecessary in raft paper
+        // but we can do this
+        // and it makes WAL-redo easier
+        _commitIndex = _log.lastIndex();
     }
 
     // FIXME not 100% safe (atomic)
@@ -703,13 +708,7 @@ inline bool Raft::updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray
             continue;
         }
         _log.append(std::move(entry));
-
-        // persistent
-        auto singleSlice = _log.fork(_log.lastIndex(), _log.lastIndex() + 1, Log::ByReference{});
-        _storage->appendLog(singleSlice);
     }
-    // FIXME safe?
-    _storage->sync();
 
     return true;
 }
@@ -718,10 +717,15 @@ inline void Raft::updateCommitIndexForReceiver(int leaderCommit) {
     // If leaderCommit > commitIndex, set commitIndex =
     // min(leaderCommit, index of last new entry)
     if(leaderCommit > _commitIndex) {
+        int oldCommit = _commitIndex;
         _commitIndex = std::min(leaderCommit, _log.lastIndex());
         CXXRAFT_LOG_DEBUG(simpleInfo(), "got latest commit index:", _commitIndex);
         CXXRAFT_LOG_DEBUG(simpleInfo(), "dump log", dump(_log.fork()));
         // _lastApplied...
+
+        // persistent
+        _storage->appendLog(_log.fork(oldCommit + 1, _commitIndex + 1, Log::ByReference {}));
+        _storage->sync();
     }
 }
 
