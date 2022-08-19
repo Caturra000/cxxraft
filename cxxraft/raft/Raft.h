@@ -175,9 +175,6 @@ private:
     // TODO remove
     void applyEntry(int index);
 
-    // TODO remove
-    int appendEntry(Command command);
-
     // The second property(If two entries in different logs have the same index
     // and term, then the logs are identical in all preceding
     // entries) is guaranteed by a simple consistency check performed by AppendEntries
@@ -195,6 +192,14 @@ private:
     bool updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray entries);
 
     void updateCommitIndexForReceiver(int leaderCommit);
+
+// for persistent
+private:
+
+    void resetMemory();
+
+    void restore();
+    void restore(std::shared_ptr<Storage> storage);
 
 public:
 

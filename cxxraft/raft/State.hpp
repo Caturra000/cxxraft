@@ -61,7 +61,9 @@ inline Reply<int, bool> Leader::onAppendEntryRPC(int term, int leaderId,
                                                  int prevLogIndex, int prevLogTerm,
                                                  Log::EntriesArray entries, int leaderCommit) {
 
-    CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC: ", term, leaderId, prevLogIndex, prevLogTerm);
+    CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC: ",
+        term, leaderId, prevLogIndex, prevLogTerm,
+        _master->dump(entries), leaderCommit);
 
     if(!isValidTransaction()) {
         return std::make_tuple(Raft::JUNK_TERM, false);
@@ -152,7 +154,9 @@ inline Reply<int, bool> Follower::onAppendEntryRPC(int term, int leaderId,
                                                    int prevLogIndex, int prevLogTerm,
                                                    Log::EntriesArray entries, int leaderCommit) {
 
-    CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC: ", term, leaderId, prevLogIndex, prevLogTerm);
+    CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC: ",
+        term, leaderId, prevLogIndex, prevLogTerm,
+        _master->dump(entries), leaderCommit);
 
     if(!isValidTransaction()) {
         return std::make_tuple(Raft::JUNK_TERM, false);
@@ -248,7 +252,9 @@ inline Reply<int, bool> Candidate::onAppendEntryRPC(int term, int leaderId,
                                                     int prevLogIndex, int prevLogTerm,
                                                     Log::EntriesArray entries, int leaderCommit) {
 
-    CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC:", term, leaderId, prevLogIndex, prevLogTerm);
+    CXXRAFT_LOG_DEBUG(_master->simpleInfo(), "onAppendEntryRPC:",
+        term, leaderId, prevLogIndex, prevLogTerm,
+        _master->dump(entries), leaderCommit);
 
     if(!isValidTransaction()) {
         return std::make_tuple(Raft::JUNK_TERM, false);

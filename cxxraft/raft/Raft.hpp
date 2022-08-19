@@ -22,34 +22,7 @@ inline Raft::Raft(const std::vector<trpc::Endpoint> &peers, int id,
         }
     }
 
-    if(auto coldData = _storage->restore()) {
-        auto &&[currentTerm, voteFor, entries] = *coldData;
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "restore from storage.",
-            "currentTerm:", currentTerm,
-            "voteFor", voteFor,
-            "entries:", dump(entries));
-        _currentTerm = currentTerm;
-        if(voteFor >= 0) _voteFor = voteFor;
-        _log.set(std::move(entries));
-
-        // It may be unnecessary in raft paper
-        // but we can do this
-        // and it makes WAL-redo easier
-        _commitIndex = _log.lastIndex();
-    }
-
-    // FIXME not 100% safe (atomic)
-    // disabled by default
-    if(_storage->isCompress()) {
-        CXXRAFT_LOG_DEBUG(simpleInfo(), "do WAL compress");
-        _storage->ftruncate();
-        _storage->backup(
-            _currentTerm,
-            _voteFor ? *_voteFor : -1,
-            _log.fork(Log::ByReference{})
-        );
-        _storage->sync();
-    }
+    restore();
 }
 
 inline void Raft::start() {
@@ -121,9 +94,17 @@ inline auto Raft::startCommand(Command command) -> std::tuple<int, int, bool> {
 
     CXXRAFT_LOG_DEBUG(simpleInfo(), "startCommand:", dump(command));
 
-    int index = appendEntry(std::move(command));
+    int lastIndex = _log.lastIndex();
 
-    return {index, term, true};
+    Log::Metadata metadata = std::make_tuple(++lastIndex, _currentTerm);
+    _log.append(metadata, std::move(command));
+
+    // persistent
+    auto singleSlice = _log.fork(lastIndex, lastIndex + 1, Log::ByReference{});
+    _storage->appendLog(singleSlice);
+    _storage->sync();
+
+    return {lastIndex, term, true};
 }
 
 inline Reply<int, bool> Raft::appendEntryRPC(int term, int leaderId,
@@ -429,7 +410,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
         bool retry = false;
 
         do {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "ping to peer", id);
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "ping to peer", dump(_peers[id]));
 
             if(retry) {
                 CXXRAFT_LOG_DEBUG(simpleInfo(), "retry due to failure or synchronization. peer:", id);
@@ -451,7 +432,8 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
             // for config test
             if(callDisabled()) return;
 
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id);
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id, "to peer", dump(peer));
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "dump sender log:", dump(_log.fork()));
 
             // TODO conflict log
 
@@ -471,7 +453,8 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                     "entries:", dump(slice));
             }
 
-            bool isHeartbeat = slice.size() == 0;
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "RAFT_APPEND_ENTRY_RPC:",
+                _currentTerm, _id, prevLogIndex, prevLogTerm, dump(slice), _commitIndex);
 
             auto reply = client->call<AppendEntryReply>(RAFT_APPEND_ENTRY_RPC, _currentTerm, _id,
                                         prevLogIndex, prevLogTerm, slice, _commitIndex);
@@ -481,7 +464,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
             }
 
             if(!reply) {
-                CXXRAFT_LOG_DEBUG(simpleInfo(), "no reply in client");
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "no reply in client", dump(peer));
                 return;
             }
 
@@ -498,11 +481,6 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                 return;
             }
 
-            // heartbeat only
-            if(isHeartbeat) {
-                return;
-            }
-
             // * If successful: update nextIndex and matchIndex for
             //   follower (§5.3)
             // * If AppendEntries fails because of log inconsistency:
@@ -510,12 +488,12 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
 
             // Note. ignore old term commit
             if(success) {
-                CXXRAFT_LOG_DEBUG(simpleInfo(), "before update peer", id, "matchIndex:", peer.matchIndex, "nextIndex:", peer.nextIndex);
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "before update peer", dump(peer));
 
                 peer.matchIndex = std::max<int>(peer.matchIndex, prevLogIndex + slice.size());
                 peer.nextIndex = std::min<int>(peer.nextIndex + slice.size(), _log.lastIndex() + 1);
 
-                CXXRAFT_LOG_DEBUG(simpleInfo(), "update peer", id, "matchIndex:", peer.matchIndex, "nextIndex:", peer.nextIndex);
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "update peer", dump(peer));
                 // FIXME performance
                 updateCommitIndexForSender();
                 // optimization
@@ -599,22 +577,6 @@ inline void Raft::applyEntry(int index) {
     _lastApplied = index;
 }
 
-inline int Raft::appendEntry(Command command) {
-
-    CXXRAFT_LOG_DEBUG(simpleInfo(), "appendEntry:", dump(command));
-
-    int nextIndex = _log.lastIndex() + 1;
-    Log::Metadata metadata = std::make_tuple(nextIndex, _currentTerm);
-    _log.append(metadata, std::move(command));
-
-    // persistent
-    auto singleSlice = _log.fork(_log.lastIndex(), _log.lastIndex() + 1, Log::ByReference{});
-    _storage->appendLog(singleSlice);
-    _storage->sync();
-
-    return nextIndex;
-}
-
 inline void Raft::updateCommitIndexForSender() {
     // performed by leader
 
@@ -644,12 +606,18 @@ inline void Raft::updateCommitIndexForSender() {
         }
         if(isMajorityMatch(N)) {
             _commitIndex = N;
-            // TODO lastApplied
+
+            // If commitIndex > lastApplied: increment lastApplied, apply
+            // log[lastApplied] to state machine (§5.3)
+            if(_commitIndex > _lastApplied) {
+                // TODO apply...
+                _lastApplied = _commitIndex;
+            }
 
             CXXRAFT_LOG_DEBUG(simpleInfo(), "got latest commit index:", N);
             CXXRAFT_LOG_DEBUG(simpleInfo(), "dump log", dump(_log.fork()));
             for(auto &&[id, peer] : _peers) {
-                CXXRAFT_LOG_DEBUG(simpleInfo(), "dump peer", id, "match:", peer.matchIndex, "next:", peer.nextIndex);
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "dump peer", dump(peer));
             }
             break;
         }
@@ -657,6 +625,8 @@ inline void Raft::updateCommitIndexForSender() {
 }
 
 inline std::optional<Log::Entry> Raft::getCommittedCopy(int index) {
+    CXXRAFT_LOG_DEBUG(simpleInfo(), "getCommittedCopy", index);
+    CXXRAFT_LOG_DEBUG(simpleInfo(), "dump log", dump(_log.fork()));
     if(index < 0 || index > _commitIndex) {
         return std::nullopt;
     }
@@ -664,18 +634,22 @@ inline std::optional<Log::Entry> Raft::getCommittedCopy(int index) {
 }
 
 inline bool Raft::updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray entries) {
-    CXXRAFT_LOG_DEBUG(simpleInfo(), "updateLog:", dump(entries));
+    CXXRAFT_LOG_DEBUG(simpleInfo(), "updateLog:", dump(entries), "all:", dump(_log.fork()));
 
     Log::Entry *pEntry;
 
     // Reply false if log doesn’t contain an entry at prevLogIndex
     // whose term matches prevLogTerm
     pEntry = _log.get(prevLogIndex, Log::ByPointer{});
-    if(pEntry && Log::getTerm(*pEntry) != prevLogTerm) {
+    if(prevLogIndex >= 0 && (!pEntry || Log::getTerm(*pEntry) != prevLogTerm)) {
         CXXRAFT_LOG_DEBUG(simpleInfo(), "reply false. prevLogTerm dismatch.",
             "prevLogIndex:", prevLogIndex,
-            "prevLogTerm:", prevLogTerm,
-            "localLogTerm:", Log::getTerm(*pEntry));
+            "prevLogTerm:", prevLogTerm);
+        if(!pEntry) {
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "no local log term");
+        } else {
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "localLogTerm:", Log::getTerm(*pEntry));
+        }
         return false;
     }
 
@@ -708,7 +682,12 @@ inline bool Raft::updateLog(int prevLogIndex, int prevLogTerm, Log::EntriesArray
             continue;
         }
         _log.append(std::move(entry));
+        auto slice = _log.fork(_log.lastIndex(), _log.lastIndex() + 1, Log::ByReference {});
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "prepare slice for storage:", dump(slice), "index:", _log.lastIndex(),
+            "all:", dump(_log.fork()));
+        _storage->appendLog(slice);
     }
+    _storage->sync();
 
     return true;
 }
@@ -717,16 +696,64 @@ inline void Raft::updateCommitIndexForReceiver(int leaderCommit) {
     // If leaderCommit > commitIndex, set commitIndex =
     // min(leaderCommit, index of last new entry)
     if(leaderCommit > _commitIndex) {
-        int oldCommit = _commitIndex;
         _commitIndex = std::min(leaderCommit, _log.lastIndex());
         CXXRAFT_LOG_DEBUG(simpleInfo(), "got latest commit index:", _commitIndex);
         CXXRAFT_LOG_DEBUG(simpleInfo(), "dump log", dump(_log.fork()));
         // _lastApplied...
+        if(_commitIndex > _lastApplied) {
+            // TODO apply
+            _lastApplied = _commitIndex;
+        }
+    }
+}
 
-        // persistent
-        _storage->appendLog(_log.fork(oldCommit + 1, _commitIndex + 1, Log::ByReference {}));
+inline void Raft::resetMemory() {
+    _storage = std::make_shared<Storage>();
+    _currentTerm = 0;
+    _voteFor = std::nullopt;
+    _log = Log{};
+    _commitIndex = 0;
+    _lastApplied = 0;
+
+    if(_fsm->flags() & FLAGS_LEADER) {
+        for(auto &&[id, peer] : _peers) {
+            peer.nextIndex = _log.lastIndex() + 1;
+            peer.matchIndex = 0;
+        }
+    }
+
+    updateTransaction();
+}
+
+inline void Raft::restore() {
+    if(auto coldData = _storage->restore()) {
+        auto &&[currentTerm, voteFor, entries] = *coldData;
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "restore from storage.",
+            "currentTerm:", currentTerm,
+            "voteFor", voteFor,
+            "entries:", dump(entries));
+        _currentTerm = currentTerm;
+        if(voteFor >= 0) _voteFor = voteFor;
+        _log.set(std::move(entries));
+    }
+
+    // FIXME not 100% safe (atomic)
+    // disabled by default
+    if(_storage->isCompress()) {
+        CXXRAFT_LOG_DEBUG(simpleInfo(), "do WAL compress");
+        _storage->ftruncate();
+        _storage->backup(
+            _currentTerm,
+            _voteFor ? *_voteFor : -1,
+            _log.fork(Log::ByReference{})
+        );
         _storage->sync();
     }
+}
+
+inline void Raft::restore(std::shared_ptr<Storage> storage) {
+    _storage = std::move(storage);
+    restore();
 }
 
 } // cxxraft

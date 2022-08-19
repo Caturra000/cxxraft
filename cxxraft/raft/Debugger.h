@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include "raft/Log.h"
+#include "raft/Peer.h"
 
 namespace cxxraft {
 
@@ -37,6 +38,19 @@ struct Debugger {
     std::string dump(Command command) {
         vsjson::Json json = command;
         return chatty(json.dump());
+    }
+
+    // (peer_id, peer_next_index, peer_match_index)
+    std::string dump(Peer peer) {
+        std::string info;
+        info.append("(")
+            .append(std::to_string(peer.id))
+            .append(", ")
+            .append(std::to_string(peer.nextIndex))
+            .append(", ")
+            .append(std::to_string(peer.matchIndex))
+            .append(")");
+        return info;
     }
 
 private:

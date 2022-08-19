@@ -68,6 +68,8 @@ struct Config: private Debugger<Config> {
 
     // start or re-start a Raft.
     // if one already exists, "kill" it first.
+    //
+    // NOTE: cannot re-start Rafts with in-memory mode
     void start(int id);
 
     // wait for at least n servers to commit.
@@ -86,7 +88,7 @@ struct Config: private Debugger<Config> {
 
     std::map<int, std::shared_ptr<Raft>> _rafts;
 
-    std::vector<std::shared_ptr<Raft>> _killed;
+    std::vector<char> _killed {};
 
     bool _persistent;
 
