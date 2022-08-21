@@ -446,7 +446,9 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                 int nextIndex = peer.nextIndex;
                 prevLogIndex = nextIndex - 1;
                 prevLogTerm = Log::getTerm(_log.get(prevLogIndex));
-                slice = _log.fork(nextIndex, nextIndex + 1, Log::ByReference{});
+                // optimization: batch
+                // slice = _log.fork(nextIndex, nextIndex + 1, Log::ByReference{});
+                slice = _log.fork(nextIndex, nextIndex + 50, Log::ByReference{});
                 CXXRAFT_LOG_DEBUG(simpleInfo(), "send AppendEntries RPC with log entries starting at",
                     "nextIndex:", nextIndex,
                     "to node:", id,
@@ -501,9 +503,11 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                     retry = true;
                 }
             } else {
+                // FIXME or because of heartbeat
                 CXXRAFT_LOG_DEBUG(simpleInfo(), "AppendEntries fails because of log inconsistency. peer id:", id);
-                if(peer.nextIndex <= 0) {
-                    CXXRAFT_LOG_WTF(simpleInfo(), "empty log failed? nextIndex:", peer.nextIndex);
+                // no retry
+                if(peer.nextIndex <= 1) {
+                    break;
                 }
                 // retry immediately
                 retry = true;

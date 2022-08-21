@@ -146,13 +146,90 @@ void testPersist32C() {
     ::exit(0);
 }
 
+// Test the scenarios described in Figure 8 of the extended Raft paper. Each
+// iteration asks a leader, if there is one, to insert a command in the Raft
+// log.  If there is a leader, that leader will fail quickly with a high
+// probability (perhaps without committing the command), or crash after a while
+// with low probability (most likey committing the command).  If the number of
+// alive servers isn't enough to form a majority, perhaps start a new server.
+// The leader in a new term may try to finish replicating log entries that
+// haven't been committed yet.
+void testFigure82C() {
+    int servers = 5;
+    auto peers = createPeers(servers);
+    auto enablePersistent = cxxraft::Config::EnablePersistent {};
+    auto config = cxxraft::Config::make(peers, enablePersistent);
+    for(size_t i = 0; i < peers.size(); ++i) {
+        config->start(i);
+    }
+
+    config->begin("Test (2C): Figure 8");
+
+    cxxraft::Command cmd;
+
+    int op = 1;
+
+    cmd["op"] = op++;
+    config->one(cmd, 1, true);
+
+    int nup = servers;
+    for(int iters = 0; iters < 1000; iters++) {
+        int leader = -1;
+        for(int i = 0; i < servers; i++) {
+            if(!config->_killed[i]) {
+                auto raft = config->_rafts[i];
+                cmd["op"] = op++;
+                auto [_1, _2, ok] = raft->startCommand(cmd);
+                if(ok) {
+                    leader = i;
+                }
+            }
+        }
+
+        if((::rand() % 1000) < 100) {
+            auto ms = ::rand() % (cxxraft::Raft::RAFT_ELECTION_TIMEOUT.count() / 2);
+            co::poll(nullptr, 0, ms);
+        } else {
+            auto ms = ::rand() % 13;
+            co::poll(nullptr, 0, ms);
+        }
+
+        if(leader != -1) {
+            config->crash(leader);
+            nup -= 1;
+        }
+
+        if(nup < 3) {
+            int s = ::rand() % servers;
+            if(config->_killed[s]) {
+                config->start(s);
+                nup += 1;
+            }
+        }
+    }
+
+    for(int i = 0; i < servers; i++) {
+        if(config->_killed[i]) {
+            config->start(i);
+        }
+    }
+
+    cmd["op"] = op++;
+    config->one(cmd, servers, true);
+
+    config->end();
+    ::exit(0);
+}
+
+
 
 int main() {
 
     TestFunction tests[] {
         testPersist12C,
         testPersist22C,
-        testPersist32C
+        testPersist32C,
+        testFigure82C
     };
 
     constexpr auto round = 10;
