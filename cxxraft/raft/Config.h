@@ -76,6 +76,12 @@ struct Config: private Debugger<Config> {
     // but don't wait forever.
     cxxraft::Command wait(int index, int n, int startTerm);
 
+    void setUnreliable();
+    void setReliable();
+    bool vnetProxy(int id);
+    void flushVnet();
+    void flushVnet(int id);
+
 //////////// verbose
 
     void begin(const char *test) { std::cout << "begin: " << test << std::endl; }
@@ -93,6 +99,22 @@ struct Config: private Debugger<Config> {
     bool _persistent;
 
     Uuid _uuid {std::chrono::system_clock::now().time_since_epoch().count()};
+
+    bool _reliable {true};
+
+    struct Vnet {
+        using Milli = std::chrono::duration<double, std::milli>;
+        constexpr static size_t RTT_MIN_VALUE = 0;
+        constexpr static size_t RTT_MAX_VALUE = 27;
+        Milli rttMin {RTT_MIN_VALUE};
+        Milli rttMax {RTT_MAX_VALUE};
+        size_t lostRate {10};
+
+        std::random_device randomDevice;
+        std::mt19937 randomEngine {randomDevice()};
+        std::uniform_int_distribution<> distRTT {RTT_MIN_VALUE, RTT_MAX_VALUE};
+        std::uniform_int_distribution<> distLost {0, 100};
+    } _vnet;
 
 };
 

@@ -221,7 +221,47 @@ void testFigure82C() {
     ::exit(0);
 }
 
+void testUnreliableAgree2C() {
+    int servers = 5;
+    auto peers = createPeers(servers);
+    auto config = cxxraft::Config::make(peers);
+    config->setUnreliable();
+    for(size_t i = 0; i < peers.size(); ++i) {
+        config->start(i);
+    }
 
+    config->begin("Test (2C): unreliable agreement");
+
+    int wg = 0;
+    auto &env = co::open();
+    cxxraft::Command cmd;
+
+    for(int iters = 1; iters < 50; iters++) {
+        for(int j = 0; j < 4; j++) {
+            wg++;
+            env.createCoroutine([&, iters, j] {
+                cxxraft::Command cmd;
+                cmd["op"] = 100 * iters + j;
+                config->one(cmd, 1, true);
+                wg--;
+            })->resume();
+        }
+        cmd["op"] = iters;
+        config->one(cmd, 1, true);
+    }
+
+    config->setReliable();
+
+    while(wg) {
+        co::poll(nullptr, 0, 50);
+    }
+
+    cmd["op"] = 100;
+    config->one(cmd, servers, true);
+
+    config->end();
+    ::exit(0);
+}
 
 int main() {
 
@@ -229,7 +269,8 @@ int main() {
         testPersist12C,
         testPersist22C,
         testPersist32C,
-        testFigure82C
+        testFigure82C,
+        testUnreliableAgree2C
     };
 
     constexpr auto round = 10;

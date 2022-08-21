@@ -28,8 +28,7 @@ inline void Config::connect(int index) {
         CXXRAFT_LOG_WTF("no server");
         return;
     }
-    auto dummy = std::function<bool(trpc::Server::ProtocolType &)>{};
-    pServer->onRequest(dummy);
+    flushVnet(index);
     _connected[index] = true;
 
     raft->_callDisabled = false;
@@ -271,6 +270,7 @@ inline void Config::start(int id) {
         raft = Raft::make(_peers, id, makeStorage());
         _connected[id] = true;
         raft->start();
+        flushVnet(id);
     // restart
     } else if(_persistent && raft) {
         raft->restore(makeStorage());
@@ -281,6 +281,7 @@ inline void Config::start(int id) {
         raft = Raft::make(_peers, id);
         _connected[id] = true;
         raft->start();
+        flushVnet(id);
     } else {
         CXXRAFT_LOG_WTF("cannot restart a raft server with in-memory mode");
         abort();
@@ -318,6 +319,48 @@ inline cxxraft::Command Config::wait(int index, int n, int startTerm) {
         abort();
     }
     return cmd;
+}
+
+inline void Config::setUnreliable() {
+    _reliable = false;
+    flushVnet();
+}
+
+inline void Config::setReliable() {
+    _reliable = true;
+    flushVnet();
+}
+
+inline bool Config::vnetProxy(int id) {
+    if(!_connected[id]) {
+        return false;
+    }
+    if(_reliable) {
+        return true;
+    }
+    auto randRTT = [&] { return _vnet.distRTT(_vnet.randomEngine); };
+    auto randLost = [&] { return _vnet.distLost(_vnet.randomEngine); };
+    using namespace std::chrono_literals;
+    if(Vnet::Milli delay {randRTT()}; delay != 0ms) {
+        co::poll(nullptr, 0, delay.count());
+    }
+    bool lost = randLost() < _vnet.lostRate;
+    return !lost;
+}
+
+inline void Config::flushVnet() {
+    for(auto &&[id, _] : _rafts) {
+        flushVnet(id);
+    }
+}
+
+inline void Config::flushVnet(int id) {
+    auto raft = _rafts[id];
+    if(!raft) return;
+    if(!raft->_rpcServer) return;
+    raft->_rpcServer->onRequest([this, id](auto &&) {
+        return vnetProxy(id);
+    });
 }
 
 } // cxxraft
