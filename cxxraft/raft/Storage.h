@@ -58,9 +58,8 @@ public:
 
     // **blocking** and **filesystem** IO
     // O_APPEND for write-ahead log (WAL)
-    // O_DIRECT for direct disk access without page cache
     constexpr static int OPEN_FLAGS =
-        O_CREAT | O_RDWR | O_APPEND | O_DIRECT;
+        O_CREAT | O_RDWR | O_APPEND;
 
     constexpr static int IN_MEMORY_OR_NO_FD = -1;
 
