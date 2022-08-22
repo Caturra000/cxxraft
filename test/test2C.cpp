@@ -263,6 +263,70 @@ void testUnreliableAgree2C() {
     ::exit(0);
 }
 
+void testFigure8Unreliable2C() {
+    int servers = 5;
+    auto peers = createPeers(servers);
+    auto config = cxxraft::Config::make(peers);
+    config->setUnreliable();
+    for(size_t i = 0; i < peers.size(); ++i) {
+        config->start(i);
+    }
+
+    config->begin("Test (2C): Figure 8 (unreliable)");
+
+    cxxraft::Command cmd;
+    cmd["op"] = ::rand() % 10000;
+    config->one(cmd, 1, true);
+
+    int nup = servers;
+    for(int iters = 0; iters < 1000; iters++) {
+        int leader = -1;
+        for(int i = 0; i < servers; i++) {
+            cmd["op"] = ::rand() % 10000;
+            auto [_1, _2, ok] = config->_rafts[i]->startCommand(cmd);
+            if(ok && config->_connected[i]) {
+                leader = i;
+            }
+        }
+
+        if((::rand() % 1000) < 100) {
+            auto ms = ::rand() % (cxxraft::Raft::RAFT_ELECTION_TIMEOUT.count() / 2);
+            co::poll(nullptr, 0, ms);
+        } else {
+            auto ms = ::rand() % 13;
+            co::poll(nullptr, 0, ms);
+        }
+
+        if(leader != -1 && (::rand() % 1000) < (cxxraft::Raft::RAFT_ELECTION_TIMEOUT.count() / 2)) {
+            config->disconnect(leader);
+            nup -= 1;
+            co::usleep(50 * 1000);
+        }
+
+        if(nup < 3) {
+            int s = ::rand() % servers;
+            if(!config->_connected[s]) {
+                config->connect(s);
+                nup += 1;
+                co::usleep(50 * 1000);
+            }
+        }
+    }
+
+    for(int i = 0; i < servers; i++) {
+        if(!config->_connected[i]) {
+            config->connect(i);
+        }
+    }
+    co::usleep(50 * 1000);
+
+    cmd["op"] = ::rand() % 10000;
+    config->one(cmd, servers, true);
+
+    config->end();
+    ::exit(0);
+}
+
 int main() {
 
     TestFunction tests[] {
@@ -270,7 +334,8 @@ int main() {
         testPersist22C,
         testPersist32C,
         testFigure82C,
-        testUnreliableAgree2C
+        testUnreliableAgree2C,
+        testFigure8Unreliable2C
     };
 
     constexpr auto round = 10;
