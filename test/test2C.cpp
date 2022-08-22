@@ -327,6 +327,160 @@ void testFigure8Unreliable2C() {
     ::exit(0);
 }
 
+void internalChurn(bool unreliable) {
+    int servers = 5;
+    auto peers = createPeers(servers);
+    auto config = cxxraft::Config::make(peers);
+    if(unreliable) {
+        config->setUnreliable();
+    }
+    for(size_t i = 0; i < peers.size(); ++i) {
+        config->start(i);
+    }
+
+    if(unreliable) {
+        config->begin("Test (2C): unreliable churn");
+    } else {
+        config->begin("Test (2C): churn");
+    }
+
+    int stop = 0;
+
+    // create concurrent clients
+    auto cfn = [=, &stop](int me, std::vector<int> &ch) {
+        std::vector<int> values;
+
+        while(!stop) {
+            int x = ::rand();
+            int index = -1;
+            bool ok = false;
+            for(int i = 0; i < servers; ++i) {
+                // try them all, maybe one of them is a leader
+                auto raft = config->_rafts[i];
+                if(!config->_killed[i]) {
+                    cxxraft::Command cmd;
+                    cmd["op"] = x;
+                    auto [index1, _, ok1] = raft->startCommand(cmd);
+                    if(ok1) {
+                        ok = ok1;
+                        index = index1;
+                    }
+                }
+            }
+            if(ok) {
+                // maybe leader will commit our value, maybe not.
+                // but don't wat forever.
+                std::vector<int> ranges {10, 20, 50, 100, 200};
+                for(auto to : ranges) {
+                    auto [nd, cmd] = config->nCommitted(index);
+                    if(nd > 0) {
+                        if(cmd["op"].to<int>() == x) {
+                            values.emplace_back(x);
+                        }
+                        break;
+                    }
+                    co::poll(nullptr, 0, to);
+                }
+            } else {
+                co::poll(nullptr, 0, 79 + me * 17);
+            }
+        }
+        ch = std::move(values);
+    };
+
+    int ncli = 3;
+    std::vector<std::vector<int>> cha(ncli);
+    auto &env = co::open();
+    for(int i = 0; i < ncli; i++) {
+        env.createCoroutine(cfn, i, std::ref(cha[i]))
+            ->resume();
+    }
+
+    for(int iters = 0; iters < 20; iters++) {
+        if(::rand() % 1000 < 200) {
+            int i = ::rand() % servers;
+            config->disconnect(i);
+        }
+
+        if(::rand() % 1000 < 500) {
+            int i = ::rand() % servers;
+            if(config->_killed[i]) {
+                config->start(i);
+            }
+        }
+
+        if(::rand() % 1000 < 200) {
+            int i = ::rand() % servers;
+            if(!config->_killed[i]) {
+                config->crash(i);
+            }
+        }
+
+        // Make crash/restart infrequent enough that the peers can often
+        // keep up, but not so infrequent that everything has settled
+        // down from one change to the next. Pick a value smaller than
+        // the election timeout, but not hugely smaller.
+        co::poll(nullptr, 0, cxxraft::Raft::RAFT_ELECTION_TIMEOUT.count() * 7 / 10);
+    }
+
+    co::poll(nullptr, 0, cxxraft::Raft::RAFT_ELECTION_TIMEOUT.count());
+    config->setReliable();
+    for(int i = 0; i < servers; i++) {
+        if(config->_killed[i]) {
+            config->start(i);
+        }
+        if(!config->_connected[i]) {
+            config->connect(i);
+        }
+    }
+
+    stop = 1;
+
+    std::vector<int> values;
+
+    for(int i = 0; i < ncli; i++) {
+        for(auto vv : cha[i]) {
+            values.emplace_back(vv);
+        }
+    }
+
+    co::poll(nullptr, 0, cxxraft::Raft::RAFT_ELECTION_TIMEOUT.count());
+
+    cxxraft::Command cmd;
+    cmd["op"] = ::rand();
+    int lastIndex = config->one(cmd, servers, true);
+
+    std::vector<int> really(lastIndex + 1);
+    for(int index = 1; index <= lastIndex; index++) {
+        auto cmdv = config->wait(index, servers, -1);
+        really.emplace_back(cmdv["op"].to<int>());
+    }
+
+    for(auto v1 : values) {
+        bool ok = false;
+        for(auto v2 : really) {
+            if(v1 == v2) {
+                ok = true;
+            }
+        }
+        if(!ok) {
+            std::cerr << "didn't find a value" << std::endl;
+            config->abort();
+        }
+    }
+
+    config->end();
+    ::exit(0);
+}
+
+void testReliableChurn2C() {
+    internalChurn(false);
+}
+
+void testUnreliableChurn2C() {
+    internalChurn(true);
+}
+
 int main() {
 
     TestFunction tests[] {
@@ -335,7 +489,9 @@ int main() {
         testPersist32C,
         testFigure82C,
         testUnreliableAgree2C,
-        testFigure8Unreliable2C
+        testFigure8Unreliable2C,
+        testReliableChurn2C,
+        testUnreliableChurn2C
     };
 
     constexpr auto round = 10;
