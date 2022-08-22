@@ -266,7 +266,8 @@ void testUnreliableAgree2C() {
 void testFigure8Unreliable2C() {
     int servers = 5;
     auto peers = createPeers(servers);
-    auto config = cxxraft::Config::make(peers);
+    auto enablePersistent = cxxraft::Config::EnablePersistent {};
+    auto config = cxxraft::Config::make(peers, enablePersistent);
     config->setUnreliable();
     for(size_t i = 0; i < peers.size(); ++i) {
         config->start(i);
@@ -275,17 +276,23 @@ void testFigure8Unreliable2C() {
     config->begin("Test (2C): Figure 8 (unreliable)");
 
     cxxraft::Command cmd;
-    cmd["op"] = ::rand() % 10000;
+
+    int op = 1;
+
+    cmd["op"] = op++;
     config->one(cmd, 1, true);
 
     int nup = servers;
     for(int iters = 0; iters < 1000; iters++) {
         int leader = -1;
         for(int i = 0; i < servers; i++) {
-            cmd["op"] = ::rand() % 10000;
-            auto [_1, _2, ok] = config->_rafts[i]->startCommand(cmd);
-            if(ok && config->_connected[i]) {
-                leader = i;
+            if(!config->_killed[i]) {
+                auto raft = config->_rafts[i];
+                cmd["op"] = op++;
+                auto [_1, _2, ok] = raft->startCommand(cmd);
+                if(ok) {
+                    leader = i;
+                }
             }
         }
 
@@ -297,30 +304,27 @@ void testFigure8Unreliable2C() {
             co::poll(nullptr, 0, ms);
         }
 
-        if(leader != -1 && (::rand() % 1000) < (cxxraft::Raft::RAFT_ELECTION_TIMEOUT.count() / 2)) {
-            config->disconnect(leader);
+        if(leader != -1) {
+            config->crash(leader);
             nup -= 1;
-            co::usleep(50 * 1000);
         }
 
         if(nup < 3) {
             int s = ::rand() % servers;
-            if(!config->_connected[s]) {
-                config->connect(s);
+            if(config->_killed[s]) {
+                config->start(s);
                 nup += 1;
-                co::usleep(50 * 1000);
             }
         }
     }
 
     for(int i = 0; i < servers; i++) {
-        if(!config->_connected[i]) {
-            config->connect(i);
+        if(config->_killed[i]) {
+            config->start(i);
         }
     }
-    co::usleep(50 * 1000);
 
-    cmd["op"] = ::rand() % 10000;
+    cmd["op"] = op++;
     config->one(cmd, servers, true);
 
     config->end();
@@ -330,7 +334,9 @@ void testFigure8Unreliable2C() {
 void internalChurn(bool unreliable) {
     int servers = 5;
     auto peers = createPeers(servers);
-    auto config = cxxraft::Config::make(peers);
+    auto enablePersistent = cxxraft::Config::EnablePersistent {};
+    auto config = cxxraft::Config::make(peers, enablePersistent);
+
     if(unreliable) {
         config->setUnreliable();
     }
