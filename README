@@ -3,10 +3,11 @@
 cxxraft实现的特性有：
 * 选举和心跳
 * 日志副本
-* 持久化
+* 基于WAL的持久化
 * batch RPC
 * 快速恢复
 * 协程并发
+* 不可靠网络模拟（目前仅供config debug使用）
 
 测试部分是从MIT6.824中test_test.go文件适配过来的，详见test目录
 你可以从中了解如何使用和改造raft，以及哪些需要注意的case
