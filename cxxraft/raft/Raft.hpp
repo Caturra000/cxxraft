@@ -409,6 +409,14 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
         // retry for appendEntries, not heartbeat
         bool retry = false;
 
+        // binary lifting
+        bool lifting = false;
+        constexpr int minBatch = 128;
+        constexpr int maxBatch = 1024;
+        auto nextBatch = [&, batch = minBatch << 1]() mutable {
+            return batch = lifting ? std::min(maxBatch, batch << 1) : std::max(minBatch, batch >> 1);
+        };
+
         do {
             CXXRAFT_LOG_DEBUG(simpleInfo(), "ping to peer", dump(_peers[id]));
 
@@ -448,7 +456,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                 prevLogTerm = Log::getTerm(_log.get(prevLogIndex));
                 // optimization: batch
                 // slice = _log.fork(nextIndex, nextIndex + 1, Log::ByReference{});
-                slice = _log.fork(nextIndex, nextIndex + 50, Log::ByReference{});
+                slice = _log.fork(nextIndex, nextIndex + nextBatch(), Log::ByReference{});
                 CXXRAFT_LOG_DEBUG(simpleInfo(), "send AppendEntries RPC with log entries starting at",
                     "nextIndex:", nextIndex,
                     "to node:", id,
@@ -501,6 +509,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                 // optimization
                 if(_log.lastIndex() >= peer.nextIndex) {
                     retry = true;
+                    lifting = true;
                 }
             } else {
                 // FIXME or because of heartbeat
@@ -511,6 +520,7 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                 }
                 // retry immediately
                 retry = true;
+                lifting = false;
                 // Optimization: fast backup
                 // nextIndex <= lastIndex
                 int failTerm = Log::getTerm(_log.get(peer.nextIndex));
