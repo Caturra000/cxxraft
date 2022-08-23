@@ -413,32 +413,29 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
         bool lifting = false;
         constexpr int minBatch = 128;
         constexpr int maxBatch = 1024;
-        auto nextBatch = [&, batch = minBatch << 1]() mutable {
+        auto nextBatch = [&, batch = minBatch]() mutable {
             return batch = lifting ? std::min(maxBatch, batch << 1) : std::max(minBatch, batch >> 1);
         };
 
-        do {
-            CXXRAFT_LOG_DEBUG(simpleInfo(), "ping to peer", dump(_peers[id]));
+        auto &peer = _peers[id];
+        auto client = trpc::Client::make(peer.endpoint);
+
+        if(client) do {
+            CXXRAFT_LOG_DEBUG(simpleInfo(), "ping to peer", dump(peer));
 
             if(retry) {
-                CXXRAFT_LOG_DEBUG(simpleInfo(), "retry due to failure or synchronization. peer:", id);
+                CXXRAFT_LOG_DEBUG(simpleInfo(), "retry due to failure or synchronization.");
+                retry = false;
             }
 
-            // reset
-            retry = false;
-
-            if(!isValidTransaction(transaction)) return;
-
-            auto &peer = _peers[id];
-
-            auto client = trpc::Client::make(peer.endpoint);
-
-            if(!client) return;
-
-            if(!isValidTransaction(transaction)) return;
+            if(!isValidTransaction(transaction)) {
+                return;
+            }
 
             // for config test
-            if(callDisabled()) return;
+            if(callDisabled()) {
+                return;
+            }
 
             CXXRAFT_LOG_DEBUG(simpleInfo(), "maintainAuthority. call append entey:", _currentTerm, _id, "to peer", dump(peer));
             CXXRAFT_LOG_DEBUG(simpleInfo(), "dump sender log:", dump(_log.fork()));
@@ -512,7 +509,6 @@ inline void Raft::maintainAuthorityToClients(size_t transaction) {
                     lifting = true;
                 }
             } else {
-                // FIXME or because of heartbeat
                 CXXRAFT_LOG_DEBUG(simpleInfo(), "AppendEntries fails because of log inconsistency. peer id:", id);
                 // no retry
                 if(peer.nextIndex <= 1) {
