@@ -28,21 +28,13 @@ inline void Config::connect(int index) {
         CXXRAFT_LOG_WTF("no server");
         return;
     }
-    flushVnet(index);
+    // config
     _connected[index] = true;
-
+    // server
+    flushVnet(index);
+    // client
+    // FIXME elegant code
     raft->_callDisabled = false;
-    raft->statePost([index, this] {
-        auto raft = _rafts[index];
-        Raft::Bitmask flags = raft->_fsm->flags();
-        if(flags & Raft::FLAGS_LEADER) {
-            raft->becomeLeader();
-        } else if(flags & Raft::FLAGS_FOLLOWER) {
-            raft->becomeFollower();
-        } else {
-            raft->becomeCandidate();
-        }
-    });
 }
 
 inline void Config::disconnect(int index) {
@@ -55,12 +47,11 @@ inline void Config::disconnect(int index) {
         CXXRAFT_LOG_WTF("no server");
         return;
     }
-    pServer->onRequest([](auto&&) {
-        return false;
-    });
+    // config
     _connected[index] = false;
-    // cancel all jobs
-    raft->updateTransaction();
+    // server
+    flushVnet(index);
+    // client
     raft->_callDisabled = true;
 }
 
